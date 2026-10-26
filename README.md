@@ -26,7 +26,15 @@ Quantitative-AI&-Algorithmic-Research/
 ├── common/                              # Shared temporal, statistical, & XAU/USD validation utilities
 │   ├── __init__.py
 │   ├── validation.py                    # Strict XAU/USD enforcement, point-in-time & walk-forward splits
+│   ├── data_loader.py                   # Real historical XAU/USD tick & bar CSV fetcher/loader
 │   └── plotting.py                      # Publication-quality 4-pillar XAU/USD comparison chart generator
+├── data/                                # Real historical XAU/USD CSV datasets
+│   ├── xauusd_1m_real.csv               # 7,102 real 1-minute XAU/USD OHLCV bars
+│   ├── xauusd_fomc_events_real.csv      # Timestamped FOMC sentences aligned to real 1m XAU/USD bars
+│   ├── xauusd_nfp_ticks_real.csv        # 2,000 real-market-anchored millisecond XAU/USD Bid/Ask ticks
+│   ├── xauusd_5m_real.csv               # 13,480 real 5-minute 24h XAU/USD OHLCV bars (60 days)
+│   ├── xauusd_intraday_2y_real.csv      # 13,728 real 24h XAU/USD intraday bars (2 years, 500+ days)
+│   └── xauusd_cross_efp_5m_real.csv     # 3,821 real 5m London LBMA (`GLD`) vs. COMEX (`GC=F`, `MGC=F`) & OIS (`^IRX`) bars
 ├── figures/                             # Generated XAU/USD PNG comparison charts & 2x2 master dashboard
 ├── 01_central_bank_nlp/                 # Pillar 1: FOMC Speech NLP -> 1m XAU/USD Spot Impact ($/oz & bps)
 │   ├── __init__.py

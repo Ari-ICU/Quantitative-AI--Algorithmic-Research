@@ -231,8 +231,7 @@ def load_xauusd_cross_efp_bars_from_csv(
     """
     df = load_real_xauusd_cross_efp_csv(csv_path)
     if n_bars is not None and n_bars < len(df):
-        # Slice around index 1550 where the real September FOMC & quarterly EFP transition occurs
-        start = max(0, min(len(df) - n_bars, 1550 - n_bars // 2))
+        start = max(0, min(len(df) - n_bars, 850 - n_bars // 2))
         df = df.iloc[start : start + n_bars].reset_index(drop=True)
     return df
 

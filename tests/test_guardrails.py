@@ -16,6 +16,18 @@ import tempfile
 import unittest
 import numpy as np
 
+from common.data_loader import (
+    XAUUSD_1M_CSV,
+    XAUUSD_5M_CSV,
+    XAUUSD_CROSS_EFP_5M_CSV,
+    XAUUSD_FOMC_EVENTS_CSV,
+    XAUUSD_INTRADAY_2Y_CSV,
+    XAUUSD_NFP_TICKS_CSV,
+    load_real_xauusd_1m_bars_csv,
+    load_real_xauusd_cross_efp_csv,
+    load_real_xauusd_intraday_bars_csv,
+    load_real_xauusd_ticks_csv,
+)
 from common.validation import (
     DEFAULT_PAIR,
     DataLeakageError,
@@ -200,6 +212,36 @@ class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
             for path in chart_paths.values():
                 self.assertTrue(path.exists())
                 self.assertGreater(path.stat().st_size, 10_000)
+
+    def test_real_xauusd_csv_datasets_and_loaders(self) -> None:
+        """Verify all real historical XAU/USD tick and bar CSV files in `data/` exist and load cleanly."""
+        for csv_file in [
+            XAUUSD_1M_CSV,
+            XAUUSD_FOMC_EVENTS_CSV,
+            XAUUSD_NFP_TICKS_CSV,
+            XAUUSD_5M_CSV,
+            XAUUSD_INTRADAY_2Y_CSV,
+            XAUUSD_CROSS_EFP_5M_CSV,
+        ]:
+            self.assertTrue(csv_file.exists(), f"Missing real XAU/USD CSV: {csv_file}")
+            self.assertGreater(csv_file.stat().st_size, 500)
+
+        df_1m = load_real_xauusd_1m_bars_csv()
+        self.assertGreater(len(df_1m), 5000)
+        self.assertTrue((df_1m["pair"] == "XAU/USD").all())
+
+        df_ticks = load_real_xauusd_ticks_csv()
+        self.assertGreaterEqual(len(df_ticks), 2000)
+        self.assertTrue((df_ticks["ask_px"] > df_ticks["bid_px"]).all())
+
+        df_5m = load_real_xauusd_intraday_bars_csv(XAUUSD_5M_CSV)
+        self.assertGreater(len(df_5m), 10000)
+
+        df_2y = load_real_xauusd_intraday_bars_csv(XAUUSD_INTRADAY_2Y_CSV)
+        self.assertGreater(len(df_2y), 10000)
+
+        df_cross = load_real_xauusd_cross_efp_csv()
+        self.assertGreater(len(df_cross), 3000)
 
 
 if __name__ == "__main__":
