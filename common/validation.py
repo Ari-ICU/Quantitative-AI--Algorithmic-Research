@@ -10,9 +10,10 @@ and protection against physical bullion EFP / Gold Lease-Rate (CIP) funding sque
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Iterator, Tuple
+from datetime import datetime, timedelta
+from typing import Iterator, Sequence, Tuple
 import numpy as np
+from scipy import stats
 
 DEFAULT_PAIR: str = "XAU/USD"
 XAUUSD_PIP_SIZE: float = 0.01          # $0.01 per troy ounce (1 standard XAU/USD lot = 100 oz)
@@ -131,3 +132,95 @@ class PurgedEmbargoWalkForwardSplit:
             yield train_idx, test_idx
 
             train_end += self.step_size + self.embargo_size
+
+
+def assert_no_target_feature_timestamp_leakage(
+    train_target_timestamps: Sequence[datetime],
+    test_feature_timestamps: Sequence[datetime],
+    embargo_td: timedelta = timedelta(0),
+    context: str = "",
+) -> None:
+    """
+    Verify timestamp-level purge & embargo separation between training target horizons
+    and out-of-sample test features:
+        `max(train_target_timestamp) + embargo_td < min(test_feature_timestamp)`
+    """
+    if len(train_target_timestamps) == 0 or len(test_feature_timestamps) == 0:
+        raise ValueError("train_target_timestamps and test_feature_timestamps must be non-empty.")
+
+    max_train_target_ts = max(train_target_timestamps)
+    min_test_feature_ts = min(test_feature_timestamps)
+    embargo_cutoff = max_train_target_ts + embargo_td
+
+    if embargo_cutoff >= min_test_feature_ts:
+        prefix = f"[{context}] " if context else ""
+        raise DataLeakageError(
+            f"{prefix}Temporal target-to-feature leakage: max(train_target_timestamp) + embargo "
+            f"({embargo_cutoff.isoformat()}) >= min(test_feature_timestamp) ({min_test_feature_ts.isoformat()})."
+        )
+
+
+def compute_deflated_sharpe_ratio(
+    returns_bps: Sequence[float] | np.ndarray,
+    n_trials: int = 4,
+    annualization_factor: float = 252.0,
+) -> float:
+    """
+    Compute the Bailey & López de Prado (2014) Deflated Sharpe Ratio (DSR) probability P(SR > SR_0)
+    for an XAU/USD strategy return stream, adjusting for non-Normal skewness, fat-tailed kurtosis,
+    finite sample length T, and multiple testing across `n_trials`.
+    """
+    r = np.asarray(returns_bps, dtype=float)
+    r = r[np.isfinite(r)]
+    n_obs = len(r)
+    if n_obs < 5 or float(np.std(r, ddof=1)) <= 1e-12:
+        return 0.0
+
+    sr_per_bar = float(np.mean(r) / np.std(r, ddof=1))
+    skew = float(stats.skew(r, bias=False)) if n_obs > 3 else 0.0
+    kurt = float(stats.kurtosis(r, fisher=False, bias=False)) if n_obs > 4 else 3.0
+
+    # Expected maximum Sharpe Ratio under null across n_trials independent configurations
+    euler_gamma = 0.5772156649
+    n_eff = max(int(n_trials), 1)
+    if n_eff == 1:
+        sr_benchmark = 0.0
+    else:
+        z1 = float(stats.norm.ppf(1.0 - 1.0 / n_eff))
+        z2 = float(stats.norm.ppf(1.0 - 1.0 / (n_eff * np.e)))
+        sr_std_null = np.sqrt(1.0 / max(n_obs - 1, 1))
+        sr_benchmark = sr_std_null * ((1.0 - euler_gamma) * z1 + euler_gamma * z2)
+
+    denom_var = max(
+        1.0 - skew * sr_per_bar + ((kurt - 1.0) / 4.0) * (sr_per_bar**2),
+        1e-9,
+    )
+    z_dsr = ((sr_per_bar - sr_benchmark) * np.sqrt(max(n_obs - 1, 1))) / np.sqrt(denom_var)
+    _ = annualization_factor  # retained for signature clarity (DSR is scale-invariant in per-period units)
+    return float(stats.norm.cdf(z_dsr))
+
+
+def compute_cost_adjusted_profit_factor(
+    gross_pnl_bps: Sequence[float] | np.ndarray,
+    positions: Sequence[float] | np.ndarray | None = None,
+    spread_cost_bps_per_turn: float = 0.45,
+    tom_next_swap_bps_per_bar: float = 0.012,
+) -> float:
+    """
+    Compute the Cost-Adjusted Net Profit Factor (Gross Gains / Gross Losses) after deducting
+    ECN XAU/USD bid-ask spread turnover drag and overnight tom-next gold lease/SOFR swap drag.
+    """
+    gross = np.asarray(gross_pnl_bps, dtype=float)
+    if positions is not None:
+        pos = np.asarray(positions, dtype=float)
+        turnover = np.abs(np.diff(pos, prepend=0.0))
+        holding = np.abs(pos)
+        net = gross - spread_cost_bps_per_turn * turnover - tom_next_swap_bps_per_bar * holding
+    else:
+        net = gross
+
+    gains = float(np.sum(np.maximum(net, 0.0)))
+    losses = float(np.sum(np.maximum(-net, 0.0)))
+    if losses <= 1e-12:
+        return float(gains) if gains > 0.0 else 1.0
+    return float(gains / losses)

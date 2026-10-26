@@ -47,7 +47,12 @@ def compute_daily_realized_variance_from_5m(intraday_5m_df: pd.DataFrame) -> pd.
 
     df["log_price"] = np.log(df["close"].astype(float))
     df["ret_5m"] = df.groupby("date")["log_price"].diff().fillna(0.0)
-    df["abs_ret_5m"] = df["ret_5m"].abs()
+    # Mask returns bridging the daily 17:00-18:00 EST maintenance break or weekend gap from continuous BV_t
+    if "is_session_open_jump" in df.columns:
+        cont_ret = np.where(df["is_session_open_jump"].to_numpy(dtype=bool), 0.0, df["ret_5m"].to_numpy(dtype=float))
+    else:
+        cont_ret = df["ret_5m"].to_numpy(dtype=float)
+    df["abs_ret_5m"] = np.abs(cont_ret)
     df["lag_abs_ret_5m"] = df.groupby("date")["abs_ret_5m"].shift(1).fillna(0.0)
 
     mu_1_sq_inv = np.pi / 2.0
@@ -65,7 +70,7 @@ def compute_daily_realized_variance_from_5m(intraday_5m_df: pd.DataFrame) -> pd.
         df.groupby("date", as_index=False)
         .agg(
             rv_daily=("ret_5m_sq", "sum"),
-            bv_daily=("bv_term", "sum"),
+            bv_raw=("bv_term", "sum"),
             rv_pos_daily=("ret_pos_sq", "sum"),
             rv_neg_daily=("ret_neg_sq", "sum"),
             rv_tokyo=("rv_tokyo_bar", "sum"),
@@ -78,12 +83,18 @@ def compute_daily_realized_variance_from_5m(intraday_5m_df: pd.DataFrame) -> pd.
         .sort_values("date")
         .reset_index(drop=True)
     )
+    # Apply Barndorff-Nielsen & Shephard finite-sample scaling M / (M - 1) to Bipower Variation BV_t
+    m_bars = np.maximum(daily["n_bars"].to_numpy(dtype=float), 2.0)
+    daily["bv_daily"] = daily["bv_raw"] * (m_bars / (m_bars - 1.0))
+    daily = daily.drop(columns=["bv_raw"])
+
     # Filter out thin weekend/holiday rollover stubs when running on real historical CSVs
     median_bars = float(daily["n_bars"].median()) if len(daily) > 0 else 0.0
     if median_bars >= 15.0:
         daily = daily[daily["n_bars"] >= 0.70 * median_bars].reset_index(drop=True)
 
     daily["rvol_ann"] = np.sqrt(252.0 * np.maximum(daily["rv_daily"], 1e-8))
+    daily["bv_vol_ann"] = np.sqrt(252.0 * np.maximum(daily["bv_daily"], 1e-8))
     daily["rvol_overlap_ann"] = np.sqrt(252.0 * np.maximum(daily["rv_london_ny_overlap"], 1e-8))
     daily["jump_component"] = np.maximum(0.0, daily["rv_daily"] - daily["bv_daily"])
     daily["semivar_asymmetry"] = daily["rv_neg_daily"] - daily["rv_pos_daily"]
@@ -92,15 +103,21 @@ def compute_daily_realized_variance_from_5m(intraday_5m_df: pd.DataFrame) -> pd.
 
 def build_har_rv_features(daily_rv_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Construct Corsi (2009) Heterogeneous Autoregressive (HAR-RV) + COMEX/LBMA overlap session,
-    signed semivariance, and jump features strictly lagged up to day t to predict
+    Construct Corsi (2009) & Andersen-Bollerslev-Diebold (2007) HAR-RV-J features with
+    COMEX/LBMA overlap session variance, signed semivariances, and asymmetric Safe-Haven
+    leverage (`pos_ret_d` r_t^+ vs. `neg_ret_d` r_t^-) strictly lagged up to day t to predict
     next-day 24-hour `XAU/USD` realized volatility `target_rvol_t1` (day t+1).
     """
     feat = daily_rv_df.copy()
+    bv_col = "bv_vol_ann" if "bv_vol_ann" in feat.columns else "rvol_ann"
     feat["rvol_d"] = feat["rvol_ann"]
     feat["rvol_w"] = feat["rvol_ann"].rolling(5).mean()
     feat["rvol_m"] = feat["rvol_ann"].rolling(22).mean()
+    feat["bv_vol_d"] = feat[bv_col]
+    feat["bv_vol_w"] = feat[bv_col].rolling(5).mean()
+    feat["bv_vol_m"] = feat[bv_col].rolling(22).mean()
     feat["jump_d"] = feat["jump_component"]
+    feat["pos_ret_d"] = np.maximum(0.0, feat["daily_log_ret"])
     feat["neg_ret_d"] = np.minimum(0.0, feat["daily_log_ret"])
     feat["rvol_overlap_d"] = (
         feat["rvol_overlap_ann"]
@@ -196,6 +213,25 @@ def _forecast_garch_one_step(train_returns_pct: np.ndarray) -> float:
         return float(np.sqrt(252.0 * (var_pct_sq * 1e-4)))
 
 
+def _forecast_har_rv_j_fold(
+    X_har_train: np.ndarray,
+    y_train: np.ndarray,
+    X_har_test: np.ndarray,
+) -> np.ndarray:
+    """
+    Fit the econometric HAR-RV-J model with asymmetric Safe-Haven leverage (Corsi, 2009; Andersen et al., 2007):
+        RV_{t+1} = beta_0 + beta_d BV_t + beta_w BV_{t-5:t} + beta_m BV_{t-22:t}
+                   + beta_J J_t + gamma^+ r_t^+ + gamma^- r_t^-
+    using QLIKE-consistent log-linear OLS strictly inside the training fold.
+    """
+    log_y = np.log(np.maximum(y_train, 0.02))
+    X_design = np.column_stack([np.ones(len(X_har_train)), X_har_train])
+    beta, _, _, _ = np.linalg.lstsq(X_design, log_y, rcond=None)
+    resid_var = float(np.var(log_y - X_design @ beta))
+    X_test_design = np.column_stack([np.ones(len(X_har_test)), X_har_test])
+    return np.maximum(0.02, np.exp(X_test_design @ beta + 0.5 * resid_var))
+
+
 def run_walk_forward_volatility_comparison(
     feat_df: pd.DataFrame,
     min_train_days: int = 120,
@@ -203,14 +239,24 @@ def run_walk_forward_volatility_comparison(
     return_series: bool = False,
 ) -> Dict[str, object]:
     """
-    Compare GARCH(1,1) vs. Leak-Free ML (Log-HAR-XAU Gradient Boosted Regressor with
-    QLIKE-consistent log-normal variance expectation) using an expanding walk-forward split.
+    Compare GARCH(1,1), Econometric HAR-RV-J (with Inverted Safe-Haven Leverage), and
+    Leak-Free ML (Log-HAR-XAU Gradient Boosted Regressor with QLIKE-consistent variance
+    expectation) using an expanding purged walk-forward split.
     """
     base_cols = ["rvol_d", "rvol_w", "rvol_m", "jump_d", "neg_ret_d"]
-    extra_cols = [c for c in ["rvol_overlap_d", "semivar_asym_d"] if c in feat_df.columns]
+    extra_cols = [c for c in ["pos_ret_d", "rvol_overlap_d", "semivar_asym_d"] if c in feat_df.columns]
     feature_cols = base_cols + extra_cols
 
+    har_cols = [
+        c
+        for c in ["bv_vol_d", "bv_vol_w", "bv_vol_m", "jump_d", "pos_ret_d", "neg_ret_d"]
+        if c in feat_df.columns
+    ]
+    if not har_cols:
+        har_cols = base_cols
+
     X_full = feat_df[feature_cols].to_numpy(dtype=float)
+    X_har_full = feat_df[har_cols].to_numpy(dtype=float)
     y_full = feat_df["target_rvol_t1"].to_numpy(dtype=float)
     ret_pct_full = (feat_df["daily_log_ret"] * 100.0).to_numpy(dtype=float)
 
@@ -224,6 +270,7 @@ def run_walk_forward_volatility_comparison(
 
     realized_list = []
     ml_forecasts = []
+    har_forecasts = []
     garch_forecasts = []
     oos_indices = []
 
@@ -244,6 +291,10 @@ def run_walk_forward_volatility_comparison(
         resid_var = float(np.var(log_y_train - ml_model.predict(X_train_scaled)))
         ml_pred = np.maximum(0.02, np.exp(ml_model.predict(X_test_scaled) + resid_var))
 
+        har_pred = _forecast_har_rv_j_fold(
+            X_har_full[train_idx], y_full[train_idx], X_har_full[test_idx]
+        )
+
         garch_pred = np.array(
             [_forecast_garch_one_step(ret_pct_full[:idx]) for idx in test_idx],
             dtype=float,
@@ -251,25 +302,30 @@ def run_walk_forward_volatility_comparison(
 
         realized_list.append(y_full[test_idx])
         ml_forecasts.append(ml_pred)
+        har_forecasts.append(har_pred)
         garch_forecasts.append(garch_pred)
         oos_indices.append(test_idx)
 
     y_eval = np.concatenate(realized_list)
     ml_eval = np.concatenate(ml_forecasts)
+    har_eval = np.concatenate(har_forecasts)
     garch_eval = np.concatenate(garch_forecasts)
     eval_idx = np.concatenate(oos_indices)
 
     out: Dict[str, object] = {
         "n_oos_days": int(len(y_eval)),
         "ml_rmse": float(np.sqrt(np.mean((y_eval - ml_eval) ** 2))),
+        "har_rv_j_rmse": float(np.sqrt(np.mean((y_eval - har_eval) ** 2))),
         "garch_rmse": float(np.sqrt(np.mean((y_eval - garch_eval) ** 2))),
         "ml_qlike": qlike_loss(y_eval, ml_eval),
+        "har_rv_j_qlike": qlike_loss(y_eval, har_eval),
         "garch_qlike": qlike_loss(y_eval, garch_eval),
     }
     if return_series:
         out["oos_dates"] = feat_df["date"].iloc[eval_idx].to_numpy()
         out["realized_rvol"] = y_eval
         out["ml_forecast_rvol"] = ml_eval
+        out["har_rv_j_forecast_rvol"] = har_eval
         out["garch_forecast_rvol"] = garch_eval
     return out
 
@@ -362,8 +418,9 @@ def _run_demo() -> None:
     metrics = run_walk_forward_volatility_comparison(feat_df, min_train_days=120, test_step_days=15)
     print(
         f"Out-of-Sample Real XAU/USD Volatility Evaluation ({metrics['n_oos_days']} trading days):\n"
-        f"  Leak-Free ML (HAR-XAU + COMEX/LBMA Session RV) -> RMSE: {metrics['ml_rmse']:.4f} | QLIKE: {metrics['ml_qlike']:.4f}\n"
-        f"  GARCH(1,1) / EWMA Baseline                     -> RMSE: {metrics['garch_rmse']:.4f} | QLIKE: {metrics['garch_qlike']:.4f}"
+        f"  Leak-Free ML (HAR-RV-J + COMEX/LBMA Session RV) -> RMSE: {metrics['ml_rmse']:.4f} | QLIKE: {metrics['ml_qlike']:.4f}\n"
+        f"  Econometric HAR-RV-J (Safe-Haven Leverage)      -> RMSE: {metrics['har_rv_j_rmse']:.4f} | QLIKE: {metrics['har_rv_j_qlike']:.4f}\n"
+        f"  GARCH(1,1) / EWMA Baseline                      -> RMSE: {metrics['garch_rmse']:.4f} | QLIKE: {metrics['garch_qlike']:.4f}"
     )
 
 

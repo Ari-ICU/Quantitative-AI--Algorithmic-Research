@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
@@ -23,6 +23,8 @@ from common.validation import (
     DEFAULT_PAIR,
     DepegRiskError,
     FXRegimeOrPegBreakError,
+    compute_cost_adjusted_profit_factor,
+    compute_deflated_sharpe_ratio,
     get_fx_default_spot_price,
 )
 
@@ -99,6 +101,21 @@ def decompose_fx_cross_and_cip_basis(df: pd.DataFrame) -> pd.DataFrame:
     out["naive_basis_bps"] = (out["quoted_synthetic_xau_usd"] / out["spot_xau_usd"] - 1.0) * 1e4
     out["true_cross_basis_bps"] = (out["implied_xau_usd"] / out["spot_xau_usd"] - 1.0) * 1e4
 
+    # Cost-of-Carry Adjusted EFP Basis: y_t = ln(F_t) - ln(S_t) - EMA_5d(ln(F_t) - ln(S_t))
+    raw_log_basis_bps = (
+        np.log(np.maximum(out["implied_xau_usd"].to_numpy(dtype=float), 1e-6))
+        - np.log(np.maximum(out["spot_xau_usd"].to_numpy(dtype=float), 1e-6))
+    ) * 1e4
+    ema_carry_bps = (
+        pd.Series(raw_log_basis_bps, index=out.index)
+        .ewm(span=min(max(len(out) // 3, 24), 1440), min_periods=1)
+        .mean()
+        .to_numpy()
+    )
+    out["raw_log_efp_bps"] = raw_log_basis_bps
+    out["carry_ema_bps"] = ema_carry_bps
+    out["carry_adjusted_efp_bps"] = raw_log_basis_bps - ema_carry_bps
+
     if "ois_minus_lease_rate_bps" in out.columns and "fwd_implied_carry_bps" in out.columns:
         out["cip_basis_bps"] = out["ois_minus_lease_rate_bps"] - out["fwd_implied_carry_bps"]
     elif "ois_rate_diff_bps" in out.columns and "fwd_implied_rate_diff_bps" in out.columns:
@@ -117,17 +134,94 @@ def decompose_fx_cross_and_cip_basis(df: pd.DataFrame) -> pd.DataFrame:
 decompose_crypto_fx_basis = decompose_fx_cross_and_cip_basis
 
 
+def estimate_kalman_hedge_ratio(
+    spot_px: np.ndarray,
+    implied_px: np.ndarray,
+    process_var_q: float = 1e-7,
+    meas_var_r: float = 1e-3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate a 1D State-Space Kalman Filter dynamic hedge ratio (beta_t) between
+    Direct Spot `XAU/USD` (`spot_px`) and Synthetic/COMEX Implied `XAU/USD` (`implied_px`):
+        State equation:       beta_t = beta_{t-1} + eta_t,   eta_t ~ N(0, Q)
+        Measurement equation: y_t    = beta_t * x_t + nu_t,  nu_t  ~ N(0, R)
+    Returns `(beta_series, innovation_bps_series)`.
+    """
+    x = np.asarray(spot_px, dtype=float)
+    y = np.asarray(implied_px, dtype=float)
+    n = len(x)
+    beta_series = np.ones(n, dtype=float)
+    innov_bps = np.zeros(n, dtype=float)
+    if n == 0:
+        return beta_series, innov_bps
+
+    beta_t = float(y[0] / max(x[0], 1e-9))
+    p_t = 1e-4
+
+    for i in range(n):
+        # Prediction step
+        p_pred = p_t + process_var_q
+        y_pred = beta_t * x[i]
+        err = y[i] - y_pred
+        innov_bps[i] = (err / max(x[i], 1e-9)) * 1e4
+
+        # Kalman gain & state update
+        s_t = (x[i] ** 2) * p_pred + meas_var_r
+        k_t = (p_pred * x[i]) / max(s_t, 1e-12)
+        beta_t = beta_t + k_t * err
+        p_t = (1.0 - k_t * x[i]) * p_pred
+        beta_series[i] = beta_t
+
+    return beta_series, innov_bps
+
+
+def compute_rolling_hurst_exponent(
+    series: pd.Series | np.ndarray,
+    window: int = 288,
+    lag_tau: int = 8,
+) -> np.ndarray:
+    """
+    Compute the rolling Hurst exponent H_t on the cost-of-carry adjusted `XAU/USD` EFP basis
+    using the variance-ratio scaling relation:
+        H_t = 0.5 * log(Var(z_t - z_{t-tau}) / (tau * Var(z_t - z_{t-1}))) / log(tau) + 0.5
+    Values H_t < 0.45 indicate stationary anti-persistent mean-reversion; H_t >= 0.50 indicates
+    non-stationary momentum or a physical COMEX-London EFP regime shift.
+    """
+    s = pd.Series(np.asarray(series, dtype=float))
+    eff_win = min(max(int(window), 30), max(len(s) // 2, 30))
+    tau = max(int(lag_tau), 2)
+
+    diff_1 = s.diff(1)
+    diff_tau = s.diff(tau)
+
+    var_1 = diff_1.rolling(eff_win, min_periods=16).var().to_numpy(dtype=float)
+    var_tau = diff_tau.rolling(eff_win, min_periods=16).var().to_numpy(dtype=float)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.maximum(var_tau, 1e-12) / np.maximum(var_1, 1e-12)
+        hurst = 0.5 * (np.log(ratio) / np.log(float(tau)))
+
+    hurst = np.where(np.isfinite(hurst), np.clip(hurst, 0.05, 0.95), 0.38)
+    return hurst
+
+
 def generate_fx_cross_rate_arbitrage_signals(
     df: pd.DataFrame,
     regime_monitor: FXPegAndCIPRegimeMonitor,
     z_entry: float = 2.0,
+    z_max_entry: float = 3.5,
+    z_hard_stop: float = 4.0,
+    max_hurst: float = 0.45,
     lookback_bars: int = 60,
     ignore_regime_guardrail: bool = False,
     ignore_depeg_guardrail: bool = False,
 ) -> Dict[str, object]:
     """
-    Estimate rolling cointegration / z-score spread between Direct `XAU/USD`
-    and Synthetic / EFP-Implied `XAU/USD`, gated by `FXPegAndCIPRegimeMonitor`.
+    Estimate dynamic Kalman-Filter cointegration (`kalman_beta`), rolling Hurst exponent (`hurst_exponent`),
+    and Threshold VECM (TVECM) z-score signals between Direct `XAU/USD` and Synthetic / EFP-Implied `XAU/USD`,
+    gated by `FXPegAndCIPRegimeMonitor`:
+    - Enters mean-reversion only when |z_t| in [z_entry, z_max_entry] (default [2.0, 3.5]) and H_t < max_hurst (0.45).
+    - Triggers a hard structural-break stop if |z_t| > z_hard_stop (4.0) or during an EFP / Lease-Rate breach.
     """
     bypass_guard = bool(ignore_regime_guardrail or ignore_depeg_guardrail)
     decomposed = decompose_fx_cross_and_cip_basis(df)
@@ -151,6 +245,17 @@ def generate_fx_cross_rate_arbitrage_signals(
             "Trading naive XAU/USD basis mean-reversion during a physical London-to-COMEX EFP squeeze "
             "or Gold Lease Rate spike confuses a physical delivery dislocation for stationary ECN noise."
         )
+
+    # 1. Dynamic 1D Kalman Filter Hedge Ratio (beta_t) & Rolling Hurst Exponent (H_t)
+    kalman_beta, kalman_innov_bps = estimate_kalman_hedge_ratio(
+        decomposed["spot_xau_usd"].to_numpy(dtype=float),
+        decomposed["implied_xau_usd"].to_numpy(dtype=float),
+    )
+    decomposed["kalman_beta"] = kalman_beta
+    decomposed["kalman_innovation_bps"] = kalman_innov_bps
+    decomposed["hurst_exponent"] = compute_rolling_hurst_exponent(
+        decomposed["carry_adjusted_efp_bps"], window=288
+    )
 
     clean_mask = ~decomposed["is_regime_breach"]
     x_spot = decomposed.loc[clean_mask, "spot_xau_usd"].to_numpy(dtype=float)
@@ -190,30 +295,64 @@ def generate_fx_cross_rate_arbitrage_signals(
         (decomposed["true_cross_basis_bps"] - rolling_mean) / rolling_std
     ).fillna(0.0)
 
+    abs_z = decomposed["z_score"].abs()
+    is_structural_stop = abs_z > z_hard_stop
+    decomposed["is_structural_break_stop"] = is_structural_stop
+    hurst_ok = decomposed["hurst_exponent"] < max_hurst
+
+    # Threshold VECM Band: enter mean-reversion when |z_t| in [z_entry, z_max_entry] & H_t < max_hurst
+    in_entry_band = (abs_z >= z_entry) & (abs_z <= z_max_entry) & hurst_ok
     raw_pos = np.where(
-        decomposed["z_score"] > z_entry,
+        in_entry_band & (decomposed["z_score"] > 0.0),
         -1.0,
-        np.where(decomposed["z_score"] < -z_entry, 1.0, 0.0),
+        np.where(in_entry_band & (decomposed["z_score"] < 0.0), 1.0, 0.0),
     )
-    decomposed["position"] = np.where(decomposed["is_regime_breach"], 0.0, raw_pos)
+    # Hard flatten on EFP/Lease-Rate regime breach, |z_t| > 4.0 structural break, or 23/5 session boundary
+    session_jump_mask = (
+        decomposed["is_session_open_jump"].to_numpy(dtype=bool)
+        if "is_session_open_jump" in decomposed.columns
+        else np.zeros(len(decomposed), dtype=bool)
+    )
+    halt_mask = decomposed["is_regime_breach"].to_numpy(dtype=bool) | is_structural_stop.to_numpy(dtype=bool) | session_jump_mask
+    decomposed["position"] = np.where(halt_mask, 0.0, raw_pos)
 
     basis_change_bps = decomposed["true_cross_basis_bps"].diff().fillna(0.0)
-    turnover = pd.Series(decomposed["position"], index=decomposed.index).diff().abs().fillna(0.0)
+    pos_series = pd.Series(decomposed["position"], index=decomposed.index)
+    turnover = pos_series.diff().abs().fillna(0.0)
+    gross_pnl_bps = (pos_series.shift(1).fillna(0.0) * basis_change_bps).to_numpy(dtype=float)
+    decomposed["strategy_gross_pnl_bps"] = gross_pnl_bps
     decomposed["strategy_net_pnl_bps"] = (
-        pd.Series(decomposed["position"], index=decomposed.index).shift(1).fillna(0.0) * basis_change_bps
-        - 0.45 * turnover
+        gross_pnl_bps - 0.45 * turnover.to_numpy(dtype=float) - 0.012 * pos_series.abs().to_numpy(dtype=float)
+    )
+
+    active_returns = decomposed.loc[pos_series.shift(1).abs() > 0, "strategy_net_pnl_bps"].to_numpy(dtype=float)
+    dsr = compute_deflated_sharpe_ratio(
+        active_returns if len(active_returns) >= 5 else decomposed["strategy_net_pnl_bps"].to_numpy(dtype=float),
+        n_trials=4,
+    )
+    profit_factor = compute_cost_adjusted_profit_factor(
+        gross_pnl_bps,
+        positions=decomposed["position"].to_numpy(dtype=float),
+        spread_cost_bps_per_turn=0.45,
+        tom_next_swap_bps_per_bar=0.012,
     )
 
     return {
         "frame": decomposed,
         "hedge_ratio_beta": hedge_beta,
+        "kalman_beta_mean": float(np.mean(kalman_beta)),
+        "kalman_beta_std": float(np.std(kalman_beta)),
+        "mean_hurst_exponent": float(np.mean(decomposed["hurst_exponent"])),
         "adf_stat": float(adf_stat),
         "adf_pvalue": float(adf_pvalue),
         "regime_bars_halted": int(decomposed["is_regime_breach"].sum()),
         "depeg_bars_halted": int(decomposed["is_regime_breach"].sum()),
+        "structural_stop_bars": int(is_structural_stop.sum()),
         "max_regime_distortion_bps": float(decomposed["regime_distortion_bps"].abs().max()),
         "max_depeg_distortion_bps": float(decomposed["regime_distortion_bps"].abs().max()),
         "cumulative_net_pnl_bps": float(decomposed["strategy_net_pnl_bps"].sum()),
+        "deflated_sharpe_ratio": float(dsr),
+        "cost_adjusted_profit_factor": float(profit_factor),
     }
 
 
@@ -308,9 +447,11 @@ def _run_demo() -> None:
     print(
         f"Loaded {len(bars_df):,d} real 5m XAU/USD Cross/EFP bars from `{XAUUSD_CROSS_EFP_5M_CSV.name}`:\n"
         f"  Clean XAU/USD Inter-Contract Basis ADF Stat: {result['adf_stat']:.2f} (p={result['adf_pvalue']:.4e}) | "
-        f"XAU/USD Hedge Beta: {result['hedge_ratio_beta']:.4f}\n"
+        f"Kalman Dynamic Beta: {result['kalman_beta_mean']:.4f} (±{result['kalman_beta_std']:.4f}) | "
+        f"Mean Hurst H_t: {result['mean_hurst_exponent']:.3f}\n"
         f"  Max Real EFP / Lease-Rate Distortion Avoided: {result['max_regime_distortion_bps']:.1f} bps | "
-        f"Bars Halted by XAU/USD Circuit Breaker: {result['regime_bars_halted']}"
+        f"Bars Halted by Circuit Breaker: {result['regime_bars_halted']} | "
+        f"DSR: {result['deflated_sharpe_ratio']:.3f} | Net Profit Factor: {result['cost_adjusted_profit_factor']:.2f}"
     )
 
 

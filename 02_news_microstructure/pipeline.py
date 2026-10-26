@@ -34,8 +34,104 @@ class OrderExecutionSpec:
     latency_ms: int = 15
     order_size_lots: float = 10.0  # 1 standard XAU/USD lot = 100 troy oz (10 lots = 1,000 oz clip)
     l2_book_slope_bps_per_lot: float = 0.45
+    adverse_selection_kappa: float = 0.25  # Slippage multiplier kappa * sigma_1s
+    enforce_resiliency_gate: bool = False  # Wait for spread recovery tau_res <= 2.5x pre-NFP median
     execution_price_mode: Literal["spread_and_depth_sweep", "mid"] = "spread_and_depth_sweep"
     pair: str = DEFAULT_PAIR
+
+
+def compute_tick_order_flow_imbalance(ticks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute Cont-Kukanov-Stoikov (2014) high-frequency Order Flow Imbalance (OFI) and Micro-Price
+    on millisecond `XAU/USD` ECN ticks:
+        e_n = I_{dP_bid >= 0} q_{bid,n} - I_{dP_bid <= 0} q_{bid,n-1}
+            - I_{dP_ask <= 0} q_{ask,n} + I_{dP_ask >= 0} q_{ask,n-1}
+    """
+    out = ticks_df.copy()
+    bid_px = out["bid_px"].to_numpy(dtype=float)
+    ask_px = out["ask_px"].to_numpy(dtype=float)
+    q_bid = out["bid_sz_lots"].to_numpy(dtype=float)
+    q_ask = out["ask_sz_lots"].to_numpy(dtype=float)
+
+    d_bid = np.diff(bid_px, prepend=bid_px[0])
+    d_ask = np.diff(ask_px, prepend=ask_px[0])
+    q_bid_prev = np.roll(q_bid, 1)
+    q_ask_prev = np.roll(q_ask, 1)
+    if len(out) > 0:
+        q_bid_prev[0] = q_bid[0]
+        q_ask_prev[0] = q_ask[0]
+
+    e_n = (
+        np.where(d_bid >= 0.0, q_bid, 0.0)
+        - np.where(d_bid <= 0.0, q_bid_prev, 0.0)
+        - np.where(d_ask <= 0.0, q_ask, 0.0)
+        + np.where(d_ask >= 0.0, q_ask_prev, 0.0)
+    )
+    if len(e_n) > 0:
+        e_n[0] = 0.0
+
+    tot_q = np.maximum(q_bid + q_ask, 1e-9)
+    out["micro_px"] = (q_bid * ask_px + q_ask * bid_px) / tot_q
+    out["ofi_tick"] = e_n
+    out["ofi_rolling_50t"] = pd.Series(e_n, index=out.index).rolling(50, min_periods=1).sum().to_numpy()
+    return out
+
+
+def evaluate_liquidity_resiliency_gate(
+    ticks_df: pd.DataFrame,
+    max_spread_multiple: float = 2.5,
+    decay_lambda: float = 1.0,
+    decay_gamma_per_ms: float = 0.00045,
+) -> Dict[str, object]:
+    """
+    Evaluate the post-NFP `XAU/USD` Liquidity Resiliency Gate (tau_res):
+    1. Computes the pre-NFP baseline median spread `mu_pre_nfp_bps` (for ms < 0) and peak shock spread `spread_max_bps`.
+    2. Evaluates the exponential spread decay envelope:
+         Spread_t <= mu_pre + lambda * (Spread_max - mu_pre) * exp(-gamma * (t - t_max))
+    3. Arms execution (`is_resiliency_gate_open = True`) post-peak once effective spread compresses below
+       `max_spread_multiple * mu_pre_nfp_bps` (default 2.5x pre-NFP baseline median spread).
+    """
+    ms = ticks_df["ms_from_release"].to_numpy(dtype=float)
+    spread_bps = ticks_df["spread_bps"].to_numpy(dtype=float)
+
+    pre_mask = ms < 0
+    mu_pre_bps = float(np.median(spread_bps[pre_mask])) if np.any(pre_mask) else float(np.min(spread_bps))
+    post_mask = ms >= 0
+    post_indices = np.where(post_mask)[0]
+    if len(post_indices) > 0:
+        peak_rel_idx = int(np.argmax(spread_bps[post_indices]))
+        peak_idx = int(post_indices[peak_rel_idx])
+        t_max_ms = float(ms[peak_idx])
+        spread_max_bps = float(spread_bps[peak_idx])
+    else:
+        t_max_ms = 0.0
+        spread_max_bps = float(np.max(spread_bps))
+
+    dt_post_peak = np.maximum(0.0, ms - t_max_ms)
+    decay_envelope_bps = mu_pre_bps + decay_lambda * (spread_max_bps - mu_pre_bps) * np.exp(
+        -decay_gamma_per_ms * dt_post_peak
+    )
+    compression_threshold_bps = max_spread_multiple * mu_pre_bps
+
+    # Gate opens after peak spread shock once spread compresses below 2.5x pre-NFP median
+    gate_open = (ms < 0) | (
+        (ms >= max(t_max_ms, 250.0))
+        & (spread_bps <= compression_threshold_bps)
+        & (spread_bps <= decay_envelope_bps)
+    )
+
+    recovery_candidates = ms[(ms >= max(t_max_ms, 250.0)) & (spread_bps <= compression_threshold_bps)]
+    tau_res_ms = float(recovery_candidates[0]) if len(recovery_candidates) > 0 else float(ms[-1])
+
+    return {
+        "mu_pre_nfp_bps": mu_pre_bps,
+        "spread_max_bps": spread_max_bps,
+        "t_max_ms": t_max_ms,
+        "compression_threshold_bps": compression_threshold_bps,
+        "resiliency_recovery_ms": tau_res_ms,
+        "decay_envelope_bps": decay_envelope_bps,
+        "is_resiliency_gate_open": gate_open,
+    }
 
 
 def load_xauusd_nfp_ticks_from_csv(
@@ -52,7 +148,7 @@ def load_xauusd_nfp_ticks_from_csv(
     if n_ticks is not None and n_ticks < len(df):
         idx = np.linspace(0, len(df) - 1, n_ticks).astype(int)
         df = df.iloc[idx].reset_index(drop=True)
-    return df
+    return compute_tick_order_flow_imbalance(df)
 
 
 def generate_synthetic_nfp_ticks(
@@ -109,7 +205,7 @@ def generate_synthetic_nfp_ticks(
     micro_px = (bid_size_lots * ask_px + ask_size_lots * bid_px) / total_sz
     obi = (bid_size_lots - ask_size_lots) / total_sz
 
-    return pd.DataFrame(
+    df_out = pd.DataFrame(
         {
             "pair": pair,
             "ms_from_release": ms_offsets,
@@ -125,6 +221,7 @@ def generate_synthetic_nfp_ticks(
             "obi": obi,
         }
     )
+    return compute_tick_order_flow_imbalance(df_out)
 
 
 def compute_microstructure_metrics_duckdb(ticks_df: pd.DataFrame) -> Dict[str, float]:
@@ -216,15 +313,38 @@ def simulate_spread_aware_execution(
         )
 
     pip_size = get_fx_pip_size(spec.pair)
-    arrival_ms = spec.signal_ms_from_release + spec.latency_ms
-    eligible_entry = ticks_df.loc[ticks_df["ms_from_release"] >= arrival_ms]
+    enriched_ticks = (
+        ticks_df if "ofi_tick" in ticks_df.columns else compute_tick_order_flow_imbalance(ticks_df)
+    )
+    gate_info = evaluate_liquidity_resiliency_gate(enriched_ticks)
+    tau_res_ms = float(gate_info["resiliency_recovery_ms"])
+
+    effective_latency_ms = max(int(spec.latency_ms), 15)
+    arrival_ms = spec.signal_ms_from_release + effective_latency_ms
+    if spec.enforce_resiliency_gate and arrival_ms >= 0:
+        arrival_ms = int(max(float(arrival_ms), tau_res_ms))
+
+    eligible_entry = enriched_ticks.loc[enriched_ticks["ms_from_release"] >= arrival_ms]
     if eligible_entry.empty:
         raise ValueError(f"No tick found at or after arrival timestamp {arrival_ms}ms.")
 
     entry_tick = eligible_entry.iloc[0]
-    exit_target_ms = int(entry_tick["ms_from_release"]) + horizon_ms
-    eligible_exit = ticks_df.loc[ticks_df["ms_from_release"] >= exit_target_ms]
-    exit_tick = eligible_exit.iloc[0] if not eligible_exit.empty else ticks_df.iloc[-1]
+    entry_ms = float(entry_tick["ms_from_release"])
+    exit_target_ms = int(entry_ms) + horizon_ms
+    eligible_exit = enriched_ticks.loc[enriched_ticks["ms_from_release"] >= exit_target_ms]
+    exit_tick = eligible_exit.iloc[0] if not eligible_exit.empty else enriched_ticks.iloc[-1]
+
+    # Trailing 1-second (1000ms) micro-price volatility sigma_1s for adverse selection penalty kappa * sigma_1s
+    win_1s = enriched_ticks.loc[
+        (enriched_ticks["ms_from_release"] >= entry_ms - 1000.0)
+        & (enriched_ticks["ms_from_release"] <= entry_ms)
+    ]
+    if len(win_1s) >= 3:
+        sigma_1s_usd = float(np.std(np.diff(win_1s["micro_px"].to_numpy(dtype=float)), ddof=1))
+    else:
+        sigma_1s_usd = float(entry_tick["ask_px"] - entry_tick["bid_px"]) * 0.15
+    adverse_selection_px = float(spec.adverse_selection_kappa) * sigma_1s_usd
+    adverse_selection_bps = (adverse_selection_px / float(entry_tick["mid_px"])) * 1e4
 
     if spec.side == "buy":
         avail_l1 = float(entry_tick["ask_sz_lots"])
@@ -232,7 +352,7 @@ def simulate_spread_aware_execution(
         sweep_impact_px = float(entry_tick["mid_px"]) * (
             excess_lots * spec.l2_book_slope_bps_per_lot * 1e-4
         )
-        realized_entry_px = float(entry_tick["ask_px"]) + sweep_impact_px
+        realized_entry_px = float(entry_tick["ask_px"]) + sweep_impact_px + adverse_selection_px
         realized_exit_px = float(exit_tick["bid_px"])
         illusion_pnl_bps = (
             (float(exit_tick["mid_px"]) - float(entry_tick["mid_px"]))
@@ -248,7 +368,7 @@ def simulate_spread_aware_execution(
         sweep_impact_px = float(entry_tick["mid_px"]) * (
             excess_lots * spec.l2_book_slope_bps_per_lot * 1e-4
         )
-        realized_entry_px = float(entry_tick["bid_px"]) - sweep_impact_px
+        realized_entry_px = float(entry_tick["bid_px"]) - sweep_impact_px - adverse_selection_px
         realized_exit_px = float(exit_tick["ask_px"])
         illusion_pnl_bps = (
             (float(entry_tick["mid_px"]) - float(exit_tick["mid_px"]))
@@ -263,12 +383,15 @@ def simulate_spread_aware_execution(
     entry_spread_pips = entry_spread_usd_oz / pip_size
 
     return {
-        "arrival_ms": float(entry_tick["ms_from_release"]),
+        "arrival_ms": entry_ms,
+        "resiliency_recovery_ms": tau_res_ms,
         "entry_spread_bps": float(entry_tick["spread_bps"]),
         "entry_spread_usd_oz": float(entry_spread_usd_oz),
         "entry_spread_pips": float(entry_spread_pips),
         "l1_available_lots": avail_l1,
         "l2_excess_swept_lots": excess_lots,
+        "adverse_selection_cost_bps": float(adverse_selection_bps),
+        "ofi_at_entry": float(entry_tick["ofi_rolling_50t"]),
         "mid_price_illusion_pnl_bps": float(illusion_pnl_bps),
         "realized_spread_swept_pnl_bps": float(realized_pnl_bps),
         "realized_spread_swept_pnl_usd_oz": float(realized_pnl_usd_oz),
@@ -313,11 +436,12 @@ def _run_demo() -> None:
     )
     print(
         f"XAU/USD Order Arrival at +{sim['arrival_ms']:.0f}ms (Spread={sim['entry_spread_bps']:.2f} bps / "
-        f"${sim['entry_spread_usd_oz']:.2f}/oz, L1 Avail={sim['l1_available_lots']:.1f} lots):"
+        f"${sim['entry_spread_usd_oz']:.2f}/oz, L1 Avail={sim['l1_available_lots']:.1f} lots, "
+        f"Resiliency Recovery tau_res=+{sim['resiliency_recovery_ms']:.0f}ms):"
     )
     print(
         f"  Illusory Mid-to-Mid XAU/USD PnL: {sim['mid_price_illusion_pnl_bps']:+.2f} bps\n"
-        f"  Realized ECN Ask-Sweep to Bid XAU/USD PnL: {sim['realized_spread_swept_pnl_bps']:+.2f} bps "
+        f"  Realized ECN Ask-Sweep + Adverse-Selection XAU/USD PnL: {sim['realized_spread_swept_pnl_bps']:+.2f} bps "
         f"({sim['realized_spread_swept_pnl_usd_oz']:+.2f} $/oz | Execution Cost Drag: {sim['execution_cost_drag_bps']:.2f} bps)"
     )
 

@@ -288,8 +288,39 @@ def build_and_save_all_real_xauusd_csvs(data_dir: Path = DATA_DIR) -> Dict[str, 
     }
 
 
+def tag_xauusd_session_boundaries(
+    df: pd.DataFrame,
+    maintenance_gap_minutes: float = 45.0,
+    weekend_gap_hours: float = 24.0,
+) -> pd.DataFrame:
+    """
+    Enforce 23/5 XAU/USD (Spot Gold) session boundary awareness:
+    - Spot Gold trades 23 hours/day (Sunday 18:00 EST to Friday 17:00 EST) with a daily 60-minute
+      maintenance break from 17:00 to 18:00 EST and a 49-hour weekend closure.
+    - Tags bars immediately following the daily maintenance break (`is_daily_maintenance_jump`),
+      the Sunday 18:00 EST weekend reopening (`is_weekend_open_jump`), and their union
+      (`is_session_open_jump`) so rolling returns/lags never bridge across market closures.
+    """
+    out = df.sort_values("timestamp").reset_index(drop=True).copy()
+    ts = pd.to_datetime(out["timestamp"])
+    gap_minutes = ts.diff().dt.total_seconds().div(60.0).fillna(0.0)
+
+    weekend_min = weekend_gap_hours * 60.0
+    out["bar_gap_minutes"] = gap_minutes.round(2)
+    out["is_daily_maintenance_jump"] = (gap_minutes >= maintenance_gap_minutes) & (
+        gap_minutes < weekend_min
+    )
+    out["is_weekend_open_jump"] = gap_minutes >= weekend_min
+    out["is_session_open_jump"] = (
+        out["is_daily_maintenance_jump"] | out["is_weekend_open_jump"]
+    )
+    if len(out) > 0:
+        out.loc[0, "is_session_open_jump"] = True
+    return out
+
+
 def load_real_xauusd_1m_bars_csv(csv_path: str | Path = XAUUSD_1M_CSV) -> pd.DataFrame:
-    """Load real historical 1-minute `XAU/USD` OHLCV bars from CSV."""
+    """Load real historical 1-minute `XAU/USD` OHLCV bars from CSV with 23/5 session boundary flags."""
     p = Path(csv_path)
     if not p.exists():
         raise FileNotFoundError(f"Real XAU/USD 1m CSV not found at {p}. Run `.venv/bin/python -m common.data_loader`.")
@@ -300,7 +331,7 @@ def load_real_xauusd_1m_bars_csv(csv_path: str | Path = XAUUSD_1M_CSV) -> pd.Dat
             assert_xauusd_pair(str(pr))
     else:
         df["pair"] = DEFAULT_PAIR
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return tag_xauusd_session_boundaries(df)
 
 
 def load_real_xauusd_fomc_events_csv(csv_path: str | Path = XAUUSD_FOMC_EVENTS_CSV) -> pd.DataFrame:
@@ -348,27 +379,27 @@ def load_real_xauusd_ticks_csv(csv_path: str | Path = XAUUSD_NFP_TICKS_CSV) -> p
 def load_real_xauusd_intraday_bars_csv(
     csv_path: str | Path = XAUUSD_INTRADAY_2Y_CSV,
 ) -> pd.DataFrame:
-    """Load real historical 24-hour intraday `XAU/USD` OHLCV bars (`5m` or `1h` 2-year history) from CSV."""
+    """Load real historical 24-hour intraday `XAU/USD` OHLCV bars (`5m` or `1h` 2-year history) with 23/5 session boundary flags."""
     p = Path(csv_path)
     if not p.exists():
         raise FileNotFoundError(f"Real XAU/USD intraday CSV not found at {p}.")
     df = pd.read_csv(p)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["pair"] = DEFAULT_PAIR
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return tag_xauusd_session_boundaries(df, maintenance_gap_minutes=65.0)
 
 
 def load_real_xauusd_cross_efp_csv(
     csv_path: str | Path = XAUUSD_CROSS_EFP_5M_CSV,
 ) -> pd.DataFrame:
-    """Load real historical 5-minute `XAU/USD` Spot vs. COMEX EFP & OIS/Lease-Rate CSV."""
+    """Load real historical 5-minute `XAU/USD` Spot vs. COMEX EFP & OIS/Lease-Rate CSV with 23/5 session boundary flags."""
     p = Path(csv_path)
     if not p.exists():
         raise FileNotFoundError(f"Real XAU/USD Cross/EFP CSV not found at {p}.")
     df = pd.read_csv(p)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["pair"] = DEFAULT_PAIR
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return tag_xauusd_session_boundaries(df)
 
 
 if __name__ == "__main__":

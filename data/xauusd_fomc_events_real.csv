@@ -1,11 +1,11 @@
-speaker,central_bank,pair,sentence_timestamp,text
-Chair Powell,FED,XAU/USD,2026-10-21T16:38:00,Downside risks and softening labor demand could support a patient easing approach.
-Chair Powell,FED,XAU/USD,2026-10-22T05:37:00,Inflation remains elevated and requires restrictive policy tightening and vigilance.
-Chair Powell,FED,XAU/USD,2026-10-22T05:44:00,We are vigilant against persistent upside inflation pressures and firming yields.
-Chair Powell,FED,XAU/USD,2026-10-23T14:19:00,Another hike and firming restrictive stance remain appropriate while overheating persists.
-Chair Powell,FED,XAU/USD,2026-10-23T14:26:00,Tightening and restrictive recalibration will continue until inflation is moving down.
-Chair Powell,FED,XAU/USD,2026-10-23T14:27:00,Accommodative easing is premature while persistent inflation and elevated yields remain.
-Chair Powell,FED,XAU/USD,2026-10-23T14:30:00,Moderating growth and slowdown headwinds justify accommodative policy support.
-Chair Powell,FED,XAU/USD,2026-10-23T14:36:00,Disinflation and softening employment conditions call for patient policy recalibration.
-Chair Powell,FED,XAU/USD,2026-10-26T01:08:00,Slowdown risks and fragile demand headwinds support a cut and accommodative stance.
-Chair Powell,FED,XAU/USD,2026-10-26T01:09:00,Easing inflation pressures and downside unemployment risks allow patient support.
+speaker,central_bank,pair,event_phase,sentence_timestamp,text
+FOMC Statement,FED,XAU/USD,statement,2026-10-21T16:38:00,Downside risks softening labor demand banking fragility and safe-haven credit stress support patient easing.
+FOMC Statement,FED,XAU/USD,statement,2026-10-22T05:37:00,Inflation remains elevated and requires restrictive policy tightening and real rate vigilance.
+Chair Powell,FED,XAU/USD,qa,2026-10-22T05:44:00,We are vigilant against persistent upside inflation pressures and firming nominal yields.
+FOMC Statement,FED,XAU/USD,statement,2026-10-23T14:19:00,Another hike and firming restrictive stance remain appropriate while overheating persists.
+Chair Powell,FED,XAU/USD,qa,2026-10-23T14:26:00,Tightening and restrictive recalibration will continue until inflation is moving down.
+Chair Powell,FED,XAU/USD,qa,2026-10-23T14:27:00,Accommodative easing is premature while persistent inflation and elevated yields remain.
+FOMC Statement,FED,XAU/USD,statement,2026-10-23T14:30:00,Moderating growth slowdown headwinds and stagflation tail-risk justify accommodative liquidity support.
+Chair Powell,FED,XAU/USD,qa,2026-10-23T14:36:00,Disinflation softening employment conditions and banking stress call for patient policy recalibration.
+Chair Powell,FED,XAU/USD,qa,2026-10-26T01:08:00,Slowdown risks fragile demand headwinds and systemic contagion support a cut and accommodative stance.
+Chair Powell,FED,XAU/USD,qa,2026-10-26T01:09:00,Easing inflation pressures downside unemployment risks and fiscal fragility allow patient support.

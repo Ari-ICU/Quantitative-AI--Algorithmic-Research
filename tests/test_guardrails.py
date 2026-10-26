@@ -9,7 +9,7 @@ across the repository (compatible with both `pytest` and standard library `unitt
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import importlib
 from pathlib import Path
 import tempfile
@@ -27,6 +27,7 @@ from common.data_loader import (
     load_real_xauusd_cross_efp_csv,
     load_real_xauusd_intraday_bars_csv,
     load_real_xauusd_ticks_csv,
+    tag_xauusd_session_boundaries,
 )
 from common.validation import (
     DEFAULT_PAIR,
@@ -35,8 +36,11 @@ from common.validation import (
     ExecutionIllusionError,
     FXRegimeOrPegBreakError,
     LookAheadBiasError,
+    assert_no_target_feature_timestamp_leakage,
     assert_xauusd_pair,
     classify_fx_trading_session,
+    compute_cost_adjusted_profit_factor,
+    compute_deflated_sharpe_ratio,
     get_fx_default_spot_price,
     get_fx_pip_size,
 )
@@ -242,6 +246,99 @@ class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
 
         df_cross = load_real_xauusd_cross_efp_csv()
         self.assertGreater(len(df_cross), 3000)
+
+    def test_xauusd_blueprint_algorithmic_upgrades(self) -> None:
+        """
+        Verify all XAU/USD-specific algorithmic upgrades from the blueprint:
+        1. Timestamp-level purge/embargo assertion & 23/5 session boundary masking.
+        2. Two-Factor FOMC Policy Surprise (S_rate, S_tail) & cosine novelty weighting.
+        3. Cont-Kukanov-Stoikov OFI, Liquidity Resiliency Gate (tau_res), & adverse selection cost.
+        4. Finite-sample Bipower Variation (BV_t), Jump (J_t), & HAR-RV-J benchmark.
+        5. Cost-of-carry EFP basis, 1D Kalman Filter dynamic beta_t, Hurst H_t, DSR, & Profit Factor.
+        """
+        # 1. Timestamp purge & embargo assertion
+        train_targets = [datetime(2025, 5, 1, 16, 0), datetime(2025, 5, 2, 16, 0)]
+        overlapping_test = [datetime(2025, 5, 2, 16, 30)]
+        valid_test = [datetime(2025, 5, 5, 9, 0)]
+        with self.assertRaises(DataLeakageError):
+            assert_no_target_feature_timestamp_leakage(
+                train_targets, overlapping_test, embargo_td=timedelta(hours=2)
+            )
+        assert_no_target_feature_timestamp_leakage(
+            train_targets, valid_test, embargo_td=timedelta(hours=24)
+        )
+
+        # 23/5 Session boundary tagging on real 1m XAU/USD bars
+        df_1m = load_real_xauusd_1m_bars_csv()
+        self.assertIn("is_session_open_jump", df_1m.columns)
+        self.assertIn("is_daily_maintenance_jump", df_1m.columns)
+        self.assertIn("is_weekend_open_jump", df_1m.columns)
+        self.assertGreater(int(df_1m["is_session_open_jump"].sum()), 1)
+
+        # 2. Pillar 1: Two-Factor FOMC Policy Surprise & Cosine Novelty Weights
+        extractor = cb_nlp.VintageGuardNLPExtractor(model_id="ProsusAI/finbert")
+        real_bars, real_events = cb_nlp.load_real_xauusd_1m_bars_and_fomc_events()
+        tf = extractor.score_two_factor_fomc_surprise(real_events)
+        self.assertEqual(len(tf["rate_shock_score"]), len(real_events))
+        self.assertEqual(len(tf["tail_safe_haven_score"]), len(real_events))
+        self.assertTrue(np.all((tf["novelty_weight"] >= 0.15) & (tf["novelty_weight"] <= 1.0)))
+        aligned = cb_nlp.align_sentences_to_bars(
+            real_events,
+            tf["rate_shock_score"],
+            real_bars,
+            horizon_minutes=2,
+            tail_scores=tf["tail_safe_haven_score"],
+            novelty_weights=tf["novelty_weight"],
+        )
+        stats1 = cb_nlp.estimate_hawkish_market_impact(aligned)
+        self.assertIn("beta_statement_bps", stats1)
+        self.assertIn("beta_qa_rate_bps", stats1)
+        self.assertIn("beta_qa_tail_safe_haven_bps", stats1)
+        self.assertGreater(stats1["two_factor_r_squared"], 0.5)
+
+        # 3. Pillar 2: Tick-Rule OFI, Liquidity Resiliency Gate (tau_res), & Adverse Selection
+        ticks = news_micro.load_xauusd_nfp_ticks_from_csv()
+        self.assertIn("ofi_tick", ticks.columns)
+        self.assertIn("ofi_rolling_50t", ticks.columns)
+        gate = news_micro.evaluate_liquidity_resiliency_gate(ticks)
+        self.assertGreater(gate["resiliency_recovery_ms"], 250.0)
+        sim_gated = news_micro.simulate_spread_aware_execution(
+            ticks,
+            news_micro.OrderExecutionSpec(
+                side="buy",
+                signal_ms_from_release=50,
+                latency_ms=20,
+                enforce_resiliency_gate=True,
+                pair="XAU/USD",
+            ),
+        )
+        self.assertGreaterEqual(sim_gated["arrival_ms"], gate["resiliency_recovery_ms"])
+        self.assertGreater(sim_gated["adverse_selection_cost_bps"], 0.0)
+
+        # 4. Pillar 3: Finite-sample BV_t, Jump J_t, Safe-Haven Leverage, & HAR-RV-J benchmark
+        intraday_df = vol_model.load_xauusd_intraday_bars_from_csv()
+        daily_rv = vol_model.compute_daily_realized_variance_from_5m(intraday_df)
+        self.assertIn("bv_vol_ann", daily_rv.columns)
+        feat_df = vol_model.build_har_rv_features(daily_rv)
+        self.assertIn("pos_ret_d", feat_df.columns)
+        self.assertIn("bv_vol_d", feat_df.columns)
+        vol_res = vol_model.run_walk_forward_volatility_comparison(feat_df, min_train_days=120, test_step_days=15)
+        self.assertIn("har_rv_j_qlike", vol_res)
+        self.assertIn("har_rv_j_rmse", vol_res)
+        self.assertLess(vol_res["har_rv_j_qlike"], vol_res["garch_qlike"])
+
+        # 5. Pillar 4: Cost-of-Carry EFP Basis, 1D Kalman Filter Beta, Hurst H_t, DSR, & Profit Factor
+        bars_efp = fx_cross.load_xauusd_cross_efp_bars_from_csv(n_bars=400)
+        monitor = fx_cross.FXPegAndCIPRegimeMonitor(max_peg_deviation_bps=25.0, max_cip_basis_bps=40.0)
+        arb_res = fx_cross.generate_fx_cross_rate_arbitrage_signals(bars_efp, monitor, ignore_regime_guardrail=False)
+        f_arb = arb_res["frame"]
+        self.assertIn("carry_adjusted_efp_bps", f_arb.columns)
+        self.assertIn("kalman_beta", f_arb.columns)
+        self.assertIn("hurst_exponent", f_arb.columns)
+        self.assertIn("is_structural_break_stop", f_arb.columns)
+        self.assertGreaterEqual(arb_res["deflated_sharpe_ratio"], 0.0)
+        self.assertLessEqual(arb_res["deflated_sharpe_ratio"], 1.0)
+        self.assertGreater(arb_res["cost_adjusted_profit_factor"], 0.0)
 
 
 if __name__ == "__main__":

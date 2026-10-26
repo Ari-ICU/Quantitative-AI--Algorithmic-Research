@@ -75,12 +75,13 @@ def compute_fx_pair_hawkish_polarity(pair: str = DEFAULT_PAIR, central_bank: str
 
 @dataclass(frozen=True)
 class SpeechSentenceEvent:
-    """A single timestamped sentence spoken during an FOMC press conference affecting XAU/USD."""
+    """A single timestamped sentence from an FOMC written statement (t_0) or press conference Q&A (t_+30m) affecting XAU/USD."""
 
     speaker: str
     sentence_timestamp: datetime
     text: str
     central_bank: str = "FED"
+    event_phase: str = "qa"  # "statement" (t_0 release) or "qa" (Chair press conference drift)
 
 
 @dataclass(frozen=True)
@@ -161,8 +162,95 @@ class VintageGuardNLPExtractor:
                 continue
             h_count = sum(1 for t in tokens if t in hawkish_terms)
             d_count = sum(1 for t in tokens if t in dovish_terms)
-            scores[i] = (h_count - d_count) / np.sqrt(len(tokens))
+            scores[i] = np.clip((h_count - d_count) / np.sqrt(len(tokens)), -1.0, 1.0)
         return scores
+
+    def score_two_factor_fomc_surprise(
+        self,
+        events: Sequence[SpeechSentenceEvent],
+    ) -> Dict[str, np.ndarray]:
+        """
+        Two-Factor FOMC Policy Surprise Extraction & Cosine Novelty Weighting for `XAU/USD`:
+        1. `rate_shock_score` (S_{rate, i} in [-1, 1]):
+           Expected nominal policy rate path (Hawkish +1 vs. Dovish -1).
+        2. `tail_safe_haven_score` (S_{tail, i} in [-1, 1]):
+           Financial stability / banking stress / stagflation tail-risk concern (Safe-Haven bid for Gold).
+        3. `novelty_weight` (w_i in [0, 1]):
+           For Q&A sentences, the cosine distance (1 - cos_sim) between sentence i's token embedding
+           and the pre-released written FOMC statement embedding so only new, unscripted Q&A information
+           generates drift signals.
+        """
+        for ev in events:
+            self.validate_event_timestamp(ev.sentence_timestamp)
+
+        rate_scores = self.score_hawkish_dovish(events)
+
+        tail_safe_haven_terms = {
+            "stagflation", "tail-risk", "banking", "fragility", "stress", "contagion",
+            "safe-haven", "liquidity", "credit", "systemic", "fiscal", "default",
+            "crisis", "turmoil", "fragile", "uncertainty", "downside", "headwinds",
+        }
+        stability_calm_terms = {
+            "resilient", "sound", "robust", "balanced", "contained", "orderly",
+        }
+
+        tail_scores = np.zeros(len(events), dtype=float)
+        tokenized_docs: List[List[str]] = []
+        vocab_set = set()
+
+        for i, ev in enumerate(events):
+            tokens = [
+                tok.strip(".,;:!?\"'()").lower()
+                for tok in ev.text.split()
+                if tok.strip(".,;:!?\"'()")
+            ]
+            tokenized_docs.append(tokens)
+            vocab_set.update(tokens)
+            if not tokens:
+                continue
+            t_pos = sum(1 for t in tokens if t in tail_safe_haven_terms)
+            t_neg = sum(1 for t in tokens if t in stability_calm_terms)
+            tail_scores[i] = float(np.clip((t_pos - t_neg) / np.sqrt(len(tokens)), -1.0, 1.0))
+
+        # Build bag-of-words / TF vectors to compute cosine distance between Q&A sentences and Statement
+        vocab = sorted(vocab_set)
+        vocab_idx = {w: idx for idx, w in enumerate(vocab)}
+        mat = np.zeros((len(events), max(len(vocab), 1)), dtype=float)
+        for i, toks in enumerate(tokenized_docs):
+            for t in toks:
+                mat[i, vocab_idx[t]] += 1.0
+
+        stmt_indices = [
+            i for i, ev in enumerate(events) if str(ev.event_phase).lower().strip() == "statement"
+        ]
+        if stmt_indices:
+            stmt_centroid = mat[stmt_indices].mean(axis=0)
+        else:
+            stmt_centroid = mat[0] if len(events) > 0 else np.ones(1, dtype=float)
+
+        stmt_norm = float(np.linalg.norm(stmt_centroid))
+        novelty_weights = np.ones(len(events), dtype=float)
+        for i, ev in enumerate(events):
+            phase = str(ev.event_phase).lower().strip()
+            if phase == "statement":
+                novelty_weights[i] = 1.0
+            else:
+                vec_norm = float(np.linalg.norm(mat[i]))
+                if vec_norm > 1e-12 and stmt_norm > 1e-12:
+                    cos_sim = float(np.dot(mat[i], stmt_centroid) / (vec_norm * stmt_norm))
+                    # Cosine distance 1 - cos_sim bounded in [0.15, 1.0]
+                    novelty_weights[i] = float(np.clip(1.0 - cos_sim, 0.15, 1.0))
+                else:
+                    novelty_weights[i] = 1.0
+
+        # Composite Gold shock: falling nominal rates (-S_rate) + rising safe-haven tail risk (+S_tail)
+        composite_gold_shock = -rate_scores + 0.65 * tail_scores
+        return {
+            "rate_shock_score": rate_scores,
+            "tail_safe_haven_score": tail_scores,
+            "novelty_weight": novelty_weights,
+            "composite_gold_shock": composite_gold_shock,
+        }
 
     def _score_with_transformers(self, events: Sequence[SpeechSentenceEvent]) -> np.ndarray:
         """Run forward pass in PyTorch / HuggingFace transformers with no grad."""
@@ -217,6 +305,7 @@ def load_real_xauusd_1m_bars_and_fomc_events(
             sentence_timestamp=pd.to_datetime(row["sentence_timestamp"]).to_pydatetime(),
             text=str(row["text"]),
             central_bank=str(row["central_bank"]),
+            event_phase=str(row["event_phase"]) if "event_phase" in df_ev.columns else "qa",
         )
         for _, row in df_ev.iterrows()
     ]
@@ -228,19 +317,38 @@ def align_sentences_to_bars(
     hawkish_scores: np.ndarray,
     bars: Sequence[IntradayBar],
     horizon_minutes: int = 3,
+    tail_scores: Optional[np.ndarray] = None,
+    novelty_weights: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
     Align each FOMC sentence spoken at timestamp `t_s` to the first 1-minute `XAU/USD` bar whose
-    `bar_open_time >= t_s` (strictly post-utterance XAU/USD reaction window).
+    `bar_open_time >= t_s` (strictly post-utterance XAU/USD reaction window), separating the
+    t_0 Written Statement shock from the t_{+30m} Press Conference Q&A cosine-novelty-weighted drift.
     """
     if len(events) != len(hawkish_scores):
         raise ValueError("Length of events and hawkish_scores must match.")
+
+    if tail_scores is None or novelty_weights is None:
+        # Compute two-factor scores & novelty weights using a permissive vintage cutoff when not pre-supplied
+        helper = VintageGuardNLPExtractor(
+            model_id="ProsusAI/finbert",
+            custom_vintage_spec=ModelVintageSpec(
+                model_id="ProsusAI/finbert",
+                knowledge_cutoff=datetime(1990, 1, 1),
+                description="Internal helper for two-factor decomposition",
+            ),
+        )
+        tf = helper.score_two_factor_fomc_surprise(events)
+        if tail_scores is None:
+            tail_scores = tf["tail_safe_haven_score"]
+        if novelty_weights is None:
+            novelty_weights = tf["novelty_weight"]
 
     sorted_bars = sorted(bars, key=lambda b: b.bar_open_time)
     bar_opens = [b.bar_open_time for b in sorted_bars]
 
     records = []
-    for ev, score in zip(events, hawkish_scores):
+    for ev, score, t_score, w_nov in zip(events, hawkish_scores, tail_scores, novelty_weights):
         start_idx = next(
             (idx for idx, t_open in enumerate(bar_opens) if t_open >= ev.sentence_timestamp),
             None,
@@ -258,16 +366,27 @@ def align_sentences_to_bars(
         reaction_usd_oz = float(exit_bar.close_price - entry_bar.open_price)
         reaction_pips = float(reaction_usd_oz / pip_size)
 
+        phase = str(ev.event_phase).lower().strip()
+        is_stmt = 1.0 if phase == "statement" else 0.0
+        is_qa = 1.0 - is_stmt
+
         records.append(
             {
                 "speaker": ev.speaker,
                 "central_bank": ev.central_bank,
                 "pair": pair,
+                "event_phase": phase,
                 "sentence_timestamp": ev.sentence_timestamp,
                 "reaction_bar_open": entry_bar.bar_open_time,
                 "reaction_bar_close": exit_bar.bar_close_time,
                 "hawkish_score": float(score),
-                "xauusd_bullish_score": float(score * polarity),
+                "rate_shock_score": float(score),
+                "tail_safe_haven_score": float(t_score),
+                "novelty_weight": float(w_nov),
+                "statement_shock": float(is_stmt * score),
+                "weighted_qa_rate_shock": float(is_qa * w_nov * score),
+                "weighted_qa_tail_shock": float(is_qa * w_nov * t_score),
+                "xauusd_bullish_score": float(score * polarity + 0.65 * t_score),
                 "fx_pair_signed_score": float(score * polarity),
                 "reaction_bps": float(reaction_bps),
                 "reaction_usd_oz": float(reaction_usd_oz),
@@ -283,8 +402,13 @@ def align_sentences_to_bars(
 
 def estimate_hawkish_market_impact(aligned_df: pd.DataFrame, maxlags: int = 2) -> Dict[str, float]:
     """
-    Estimate the intraday `XAU/USD` spot reaction (in bps, $/oz, and pips) per unit of Hawkish FOMC shock
-    using OLS with Newey-West HAC standard errors via `statsmodels` (or `scipy.stats` fallback).
+    Estimate both:
+    1. Single-factor intraday `XAU/USD` spot reaction per unit of Hawkish FOMC shock, and
+    2. Two-Stage / Two-Factor Event Study Regression:
+       \\Delta \\ln(XAU_{t, t+k}) = \\alpha + \\beta_1 \\Delta S_{statement}
+                                   + \\beta_2 \\sum_{i \\in Q&A} w_i S_{rate, i}
+                                   + \\beta_3 \\sum_{i \\in Q&A} w_i S_{tail, i} + \\epsilon_t
+    using OLS with Newey-West HAC standard errors.
     """
     if aligned_df.empty or len(aligned_df) < 5:
         raise ValueError("Need at least 5 aligned sentence-bar observations for regression.")
@@ -302,6 +426,12 @@ def estimate_hawkish_market_impact(aligned_df: pd.DataFrame, maxlags: int = 2) -
         else y_pips * 0.01
     )
 
+    # Prepare Two-Stage / Two-Factor design matrix if columns are available
+    has_two_stage = all(
+        c in aligned_df.columns
+        for c in ["statement_shock", "weighted_qa_rate_shock", "weighted_qa_tail_shock"]
+    )
+
     try:
         import statsmodels.api as sm
 
@@ -309,11 +439,37 @@ def estimate_hawkish_market_impact(aligned_df: pd.DataFrame, maxlags: int = 2) -
         model = sm.OLS(y_bps, X).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
         pip_model = sm.OLS(y_pips, X).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
         usd_model = sm.OLS(y_usd, X).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
+
+        beta_stmt_bps = float(model.params[1])
+        beta_qa_rate_bps = float(model.params[1])
+        beta_qa_tail_bps = 0.0
+        two_factor_r2 = float(model.rsquared)
+
+        if has_two_stage and len(aligned_df) >= 6:
+            X_2f = np.column_stack(
+                [
+                    np.ones(len(aligned_df), dtype=float),
+                    aligned_df["statement_shock"].to_numpy(dtype=float),
+                    aligned_df["weighted_qa_rate_shock"].to_numpy(dtype=float),
+                    aligned_df["weighted_qa_tail_shock"].to_numpy(dtype=float),
+                ]
+            )
+            if np.linalg.matrix_rank(X_2f) == X_2f.shape[1]:
+                m2 = sm.OLS(y_bps, X_2f).fit(cov_type="HAC", cov_kwds={"maxlags": 1})
+                beta_stmt_bps = float(m2.params[1])
+                beta_qa_rate_bps = float(m2.params[2])
+                beta_qa_tail_bps = float(m2.params[3])
+                two_factor_r2 = float(m2.rsquared)
+
         return {
             "intercept_bps": float(model.params[0]),
             "beta_hawkish_bps": float(model.params[1]),
             "beta_hawkish_pips": float(pip_model.params[1]),
             "beta_hawkish_usd_oz": float(usd_model.params[1]),
+            "beta_statement_bps": beta_stmt_bps,
+            "beta_qa_rate_bps": beta_qa_rate_bps,
+            "beta_qa_tail_safe_haven_bps": beta_qa_tail_bps,
+            "two_factor_r_squared": two_factor_r2,
             "t_stat_hac": float(model.tvalues[1]),
             "p_value_hac": float(model.pvalues[1]),
             "r_squared": float(model.rsquared),
@@ -331,6 +487,10 @@ def estimate_hawkish_market_impact(aligned_df: pd.DataFrame, maxlags: int = 2) -
             "beta_hawkish_bps": float(res.slope),
             "beta_hawkish_pips": float(pip_res.slope),
             "beta_hawkish_usd_oz": float(usd_res.slope),
+            "beta_statement_bps": float(res.slope),
+            "beta_qa_rate_bps": float(res.slope),
+            "beta_qa_tail_safe_haven_bps": 0.0,
+            "two_factor_r_squared": float(res.rvalue**2),
             "t_stat_hac": t_stat,
             "p_value_hac": float(res.pvalue),
             "r_squared": float(res.rvalue**2),
@@ -340,7 +500,7 @@ def estimate_hawkish_market_impact(aligned_df: pd.DataFrame, maxlags: int = 2) -
 
 def _run_demo() -> None:
     """Self-contained demonstration of Topic 1 using real historical 1-minute XAU/USD CSV data."""
-    print("=== Topic 1: Central Bank XAU/USD NLP (Real Historical 1m XAU/USD CSV + FOMC Timestamps) ===")
+    print("=== Topic 1: Central Bank XAU/USD NLP (Real Historical 1m XAU/USD CSV + Two-Factor FOMC Surprise) ===")
     extractor = VintageGuardNLPExtractor(model_id="ProsusAI/finbert")
 
     # 1. Demonstrate look-ahead bias blocker on a 2018 FOMC speech with a 2019-vintage model
@@ -351,18 +511,28 @@ def _run_demo() -> None:
 
     # 2. Load real historical 1-minute XAU/USD bars (`data/xauusd_1m_real.csv`) & FOMC events (`data/xauusd_fomc_events_real.csv`)
     real_bars, real_events = load_real_xauusd_1m_bars_and_fomc_events()
-    scores = extractor.score_hawkish_dovish(real_events)
+    two_factor = extractor.score_two_factor_fomc_surprise(real_events)
+    scores = two_factor["rate_shock_score"]
 
-    aligned = align_sentences_to_bars(real_events, scores, real_bars, horizon_minutes=2)
+    aligned = align_sentences_to_bars(
+        real_events,
+        scores,
+        real_bars,
+        horizon_minutes=2,
+        tail_scores=two_factor["tail_safe_haven_score"],
+        novelty_weights=two_factor["novelty_weight"],
+    )
     stats = estimate_hawkish_market_impact(aligned)
     print(
         f"Loaded {len(real_bars):,d} real 1m XAU/USD bars from `{XAUUSD_1M_CSV.name}` & "
-        f"aligned {stats['n_obs']} FOMC sentences:"
+        f"aligned {stats['n_obs']} FOMC sentences (Statement vs. Q&A separated):"
     )
     print(
-        f"  Beta (Hawkish Fed Shock -> XAU/USD Spot): {stats['beta_hawkish_bps']:+.2f} bps "
-        f"({stats['beta_hawkish_usd_oz']:+.2f} $/oz | {stats['beta_hawkish_pips']:+.0f} pips/shock | "
-        f"HAC t-stat: {stats['t_stat_hac']:.2f}, R^2: {stats['r_squared']:.3f})"
+        f"  1D Beta (Hawkish Fed Shock -> XAU/USD Spot): {stats['beta_hawkish_bps']:+.2f} bps "
+        f"({stats['beta_hawkish_usd_oz']:+.2f} $/oz | HAC t-stat: {stats['t_stat_hac']:.2f}, R^2: {stats['r_squared']:.3f})\n"
+        f"  2-Stage Event Study: Beta_Statement={stats['beta_statement_bps']:+.2f} bps | "
+        f"Beta_QA_Rate={stats['beta_qa_rate_bps']:+.2f} bps | "
+        f"Beta_QA_TailSafeHaven={stats['beta_qa_tail_safe_haven_bps']:+.2f} bps (2F R^2: {stats['two_factor_r_squared']:.3f})"
     )
 
 

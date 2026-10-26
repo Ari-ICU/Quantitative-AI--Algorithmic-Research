@@ -92,7 +92,10 @@ def plot_pillar1_central_bank_fx_nlp(output_dir: Path) -> Path:
         intercept_usd + slope_usd * x_line,
         color="#facc15",
         linewidth=2.2,
-        label=f"OLS HAC Fit: {slope_usd:+.2f} $/oz ({stats['beta_hawkish_bps']:+.1f} bps/shock, R²={stats['r_squared']:.2f})",
+        label=(
+            f"OLS HAC: {slope_usd:+.2f} $/oz ({stats['beta_hawkish_bps']:+.1f} bps, "
+            f"1F R²={stats['r_squared']:.2f} | 2F Stmt/QA/Tail R²={stats['two_factor_r_squared']:.2f})"
+        ),
     )
     ax2.axhline(0, color="#94a3b8", linewidth=1, linestyle="--")
     ax2.axvline(0, color="#94a3b8", linewidth=1, linestyle="--")
@@ -131,6 +134,13 @@ def plot_pillar2_fx_news_microstructure(output_dir: Path) -> Path:
     ax1.plot(ms, ticks["spread_usd_oz"], color="#facc15", linewidth=1.6, label="XAU/USD ECN Spread ($/oz)")
     ax1.axvspan(0, 5000, color="#ef4444", alpha=0.18, label="5s Post-NFP Liquidity Vacuum")
     ax1.axvline(0, color="#f8fafc", linestyle="--", linewidth=1.4, label="Release Timestamp (t = 0 ms)")
+    ax1.axvline(
+        sim["resiliency_recovery_ms"],
+        color="#22c55e",
+        linestyle=":",
+        linewidth=1.8,
+        label=f"Resiliency Gate Open (τ_res = +{sim['resiliency_recovery_ms']:.0f} ms)",
+    )
 
     ax1_twin = ax1.twinx()
     ax1_twin.plot(ms, ticks["ask_sz_lots"], color="#38bdf8", alpha=0.65, linewidth=1.2, label="Top-of-Book Ask Depth (100-oz Lots)")
@@ -193,6 +203,7 @@ def plot_pillar3_fx_volatility_comparison(output_dir: Path) -> Path:
     days = np.arange(res["n_oos_days"])
     y_real = np.asarray(res["realized_rvol"]) * 100.0
     y_ml = np.asarray(res["ml_forecast_rvol"]) * 100.0
+    y_har = np.asarray(res["har_rv_j_forecast_rvol"]) * 100.0
     y_garch = np.asarray(res["garch_forecast_rvol"]) * 100.0
 
     ax1.plot(days, y_real, color="#94a3b8", alpha=0.65, linewidth=1.3, label="Realized 24h XAU/USD RVol (%)")
@@ -202,6 +213,14 @@ def plot_pillar3_fx_volatility_comparison(output_dir: Path) -> Path:
         color="#facc15",
         linewidth=2.1,
         label=f"Leak-Free HAR-XAU ML (RMSE={res['ml_rmse']*100:.2f}%, QLIKE={res['ml_qlike']:.3f})",
+    )
+    ax1.plot(
+        days,
+        y_har,
+        color="#38bdf8",
+        linewidth=1.7,
+        linestyle="-.",
+        label=f"Econometric HAR-RV-J (RMSE={res['har_rv_j_rmse']*100:.2f}%, QLIKE={res['har_rv_j_qlike']:.3f})",
     )
     ax1.plot(
         days,
@@ -314,7 +333,11 @@ def plot_pillar4_fx_cross_rate_arbitrage(output_dir: Path) -> Path:
         alpha=0.20,
         label="Circuit Breaker Active (Position = 0)",
     )
-    ax2.set_title("Pillar 4B: Real XAU/USD Z-Score & Circuit-Breaker Gated Position", fontweight="bold")
+    ax2.set_title(
+        f"Pillar 4B: TVECM + Hurst Gated Position (H_t={res['mean_hurst_exponent']:.2f}, "
+        f"DSR={res['deflated_sharpe_ratio']:.2f}, PF={res['cost_adjusted_profit_factor']:.2f})",
+        fontweight="bold",
+    )
     ax2.set_xlabel("Real 5-Minute XAU/USD Bar Index")
     ax2.set_ylabel("Rolling Z-Score / Scaled Position")
     ax2.grid(True)
@@ -346,7 +369,13 @@ def plot_master_fx_comparison_dashboard(output_dir: Path) -> Path:
     xl = np.linspace(x_v.min() - 0.1, x_v.max() + 0.1, 50)
     b_usd = stats1["beta_hawkish_usd_oz"]
     a_usd = float(np.mean(y_v - b_usd * x_v))
-    ax.plot(xl, a_usd + b_usd * xl, color="#facc15", linewidth=2.2, label=f"Slope: {b_usd:+.2f} $/oz ({stats1['beta_hawkish_bps']:+.1f} bps/shock, R²={stats1['r_squared']:.2f})")
+    ax.plot(
+        xl,
+        a_usd + b_usd * xl,
+        color="#facc15",
+        linewidth=2.2,
+        label=f"Slope: {b_usd:+.2f} $/oz (1F R²={stats1['r_squared']:.2f}, 2F Stmt/QA/Tail R²={stats1['two_factor_r_squared']:.2f})",
+    )
     ax.axhline(0, color="#64748b", linestyle="--", linewidth=1)
     ax.set_title("1. Real 1m XAU/USD (`xauusd_1m_real.csv`): FOMC Score vs. $/oz", fontweight="bold")
     ax.set_xlabel("Vintage-Gated FOMC Net Hawkish Score")
@@ -383,6 +412,7 @@ def plot_master_fx_comparison_dashboard(output_dir: Path) -> Path:
     d_idx = np.arange(res3["n_oos_days"])
     ax.plot(d_idx, np.asarray(res3["realized_rvol"]) * 100.0, color="#94a3b8", alpha=0.65, label="Realized 24h XAU/USD RVol")
     ax.plot(d_idx, np.asarray(res3["ml_forecast_rvol"]) * 100.0, color="#facc15", linewidth=2.1, label=f"Leak-Free HAR-XAU ML (QLIKE={res3['ml_qlike']:.3f})")
+    ax.plot(d_idx, np.asarray(res3["har_rv_j_forecast_rvol"]) * 100.0, color="#38bdf8", linestyle="-.", linewidth=1.7, label=f"HAR-RV-J (QLIKE={res3['har_rv_j_qlike']:.3f})")
     ax.plot(d_idx, np.asarray(res3["garch_forecast_rvol"]) * 100.0, color="#f97316", linestyle="--", linewidth=1.9, label=f"GARCH(1,1) (QLIKE={res3['garch_qlike']:.3f})")
     ax.set_title("3. Real 2Y 24h XAU/USD Volatility (`xauusd_intraday_2y_real.csv`): ML vs. GARCH", fontweight="bold")
     ax.set_xlabel(f"Out-of-Sample Real Trading Days ({res3['n_oos_days']} Days)")
@@ -409,7 +439,11 @@ def plot_master_fx_comparison_dashboard(output_dir: Path) -> Path:
         alpha=0.22,
         label=f"Circuit Breaker Halted ({res4['regime_bars_halted']} bars)",
     )
-    ax.set_title("4. Real 5m XAU/USD EFP Basis (`xauusd_cross_efp_5m_real.csv`): Guarded vs. Naive", fontweight="bold")
+    ax.set_title(
+        f"4. Real 5m XAU/USD EFP Basis (Kalman β={res4['kalman_beta_mean']:.3f}, "
+        f"DSR={res4['deflated_sharpe_ratio']:.2f}, Net PF={res4['cost_adjusted_profit_factor']:.2f})",
+        fontweight="bold",
+    )
     ax.set_xlabel("Real 5-Minute XAU/USD Bar Index")
     ax.set_ylabel("XAU/USD Spot vs. EFP Basis (bps)")
     ax.grid(True)
