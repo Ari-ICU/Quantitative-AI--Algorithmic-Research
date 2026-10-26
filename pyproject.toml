@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-ai-algorithmic-research"
+version = "0.1.0"
+description = "Pure XAU/USD (Spot Gold FX) Quantitative AI & Algorithmic Research across Central Bank NLP, ECN News Microstructure, 24h Realized Volatility, and EFP/Lease-Rate Arbitrage"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
