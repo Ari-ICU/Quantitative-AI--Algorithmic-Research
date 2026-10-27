@@ -1,29 +1,97 @@
-# Byte-compiled / optimized / DLL files
+# ==============================================================================
+# Python / Backend (`backend/`, `common/`, `01`–`04`)
+# ==============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+/build/
+develop-eggs/
+/dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Virtual environments
 .venv/
 venv/
 env/
+ENV/
 
-# Data & Large Artifacts
+# Testing & Type-Checking Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================================================================
+# Next.js / Node.js Frontend (`frontend/`)
+# ==============================================================================
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+out/
+frontend/out/
+frontend/build/
+next-env.d.ts
+frontend/next-env.d.ts
+*.tsbuildinfo
+.vercel/
+.npm/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ==============================================================================
+# Environment Variables & Broker API Secrets (`OANDA_API_KEY`, `METAAPI_TOKEN`)
+# ==============================================================================
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# ==============================================================================
+# Data, Databases & Temporary Artifacts
+# ==============================================================================
+papers/
 data/raw/
 data/processed/
 *.parquet
 *.feather
 *.duckdb
 *.duckdb.wal
-
-# Model checkpoints & logs
 checkpoints/
 lightning_logs/
 wandb/
 mlruns/
+*.log
+tmp/
+temp/
 
-# IDE & OS
+# ==============================================================================
+# macOS & IDE
+# ==============================================================================
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
 .vscode/
 .idea/
 *.swp
+*.swo
+*~

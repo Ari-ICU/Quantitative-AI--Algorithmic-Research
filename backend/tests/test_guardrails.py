@@ -12,9 +12,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import importlib
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 import numpy as np
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _BACKEND_DIR.parent
+for _p in (str(_BACKEND_DIR), str(_REPO_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from common.data_loader import (
     XAUUSD_1M_CSV,
@@ -50,6 +57,8 @@ news_micro = importlib.import_module("02_news_microstructure.pipeline")
 vol_model = importlib.import_module("03_ml_vs_garch_volatility.pipeline")
 fx_cross = importlib.import_module("04_fx_cross_rate_arbitrage.pipeline")
 fx_plotting = importlib.import_module("common.plotting")
+macos_mt5 = importlib.import_module("common.macos_mt5_bridge")
+signal_engine = importlib.import_module("backend.signal_engine")
 
 
 class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
@@ -209,10 +218,10 @@ class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
         self.assertTrue(np.all(frame.loc[frame["is_regime_breach"], "position"] == 0.0))
 
     def test_xauusd_comparison_chart_generation(self) -> None:
-        """Verify all 5 XAU/USD comparison charts and master dashboard generate cleanly."""
+        """Verify all 6 XAU/USD comparison charts (including the paper benchmark chart) generate cleanly."""
         with tempfile.TemporaryDirectory() as tmpdir:
             chart_paths = fx_plotting.generate_all_fx_comparison_charts(Path(tmpdir))
-            self.assertEqual(len(chart_paths), 5)
+            self.assertEqual(len(chart_paths), 6)
             for path in chart_paths.values():
                 self.assertTrue(path.exists())
                 self.assertGreater(path.stat().st_size, 10_000)
@@ -339,6 +348,44 @@ class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
         self.assertGreaterEqual(arb_res["deflated_sharpe_ratio"], 0.0)
         self.assertLessEqual(arb_res["deflated_sharpe_ratio"], 1.0)
         self.assertGreater(arb_res["cost_adjusted_profit_factor"], 0.0)
+
+    def test_live_4pillar_xauusd_signal_engine(self) -> None:
+        """Verify the real-time 4-Pillar XAU/USD signal engine (`backend/signal_engine.py`)."""
+        bridge = macos_mt5.MacOSMetaTraderBridge(mode="live_yahoo_ecn")
+        bridge.initialize()
+        tick = bridge.symbol_info_tick("XAU/USD")
+        bars = bridge.copy_rates_from_pos("XAU/USD", macos_mt5.TIMEFRAME_M1, 0, 90, prefer_live=False)
+        sig = signal_engine.compute_live_xauusd_4pillar_signal(tick=tick, bars_df=bars)
+
+        self.assertEqual(sig["symbol"], "XAU/USD")
+        self.assertIn(sig["direction"], ("BUY", "SELL"))
+        self.assertGreater(float(sig["entry_market_price"]), 0.0)
+        self.assertGreater(float(sig["risk_usd_oz"]), 0.0)
+        self.assertIn("pillar1_macro", sig["pillars"])
+        self.assertIn("pillar2_microstructure", sig["pillars"])
+        self.assertIn("pillar3_volatility", sig["pillars"])
+        self.assertIn("pillar4_arbitrage", sig["pillars"])
+
+    def test_macos_mt5_bridge_and_live_xauusd_api(self) -> None:
+        """Verify the macOS-native MetaTrader5-compatible bridge (`MacOSMetaTraderBridge`)."""
+        bridge = macos_mt5.MacOSMetaTraderBridge(mode="live_yahoo_ecn")
+        self.assertTrue(bridge.initialize())
+
+        tick = bridge.symbol_info_tick("XAU/USD")
+        self.assertEqual(tick.symbol, "XAU/USD")
+        self.assertGreater(tick.ask, tick.bid)
+        self.assertGreater(tick.spread_bps, 0.0)
+
+        bars = bridge.copy_rates_from_pos("XAU/USD", macos_mt5.TIMEFRAME_M1, 0, 50, prefer_live=False)
+        self.assertEqual(len(bars), 50)
+        self.assertIn("is_session_open_jump", bars.columns)
+
+        with self.assertRaises(ExecutionIllusionError):
+            bridge.order_check(side="buy", volume_lots=5.0, execution_price_mode="mid")
+
+        chk = bridge.order_check(side="buy", volume_lots=5.0)
+        self.assertEqual(chk["symbol"], "XAU/USD")
+        self.assertGreaterEqual(float(chk["estimated_fill_price"]), float(chk["quoted_ask"]))
 
 
 if __name__ == "__main__":
