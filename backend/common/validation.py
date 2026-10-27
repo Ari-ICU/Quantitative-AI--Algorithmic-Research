@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterator, Sequence, Tuple
 import numpy as np
+import pandas as pd
 from scipy import stats
 
 DEFAULT_PAIR: str = "XAU/USD"
@@ -224,3 +225,61 @@ def compute_cost_adjusted_profit_factor(
     if losses <= 1e-12:
         return float(gains) if gains > 0.0 else 1.0
     return float(gains / losses)
+
+
+def compute_bipower_variation_and_jumps(
+    returns: Sequence[float] | np.ndarray,
+) -> Tuple[float, float, float]:
+    """
+    Compute Barndorff-Nielsen & Shephard (2004, 2006) Realized Variance (RV),
+    Finite-Sample Scaled Bipower Variation (BV), and Jump Component (J) on high-frequency returns:
+        RV_t = sum_{i=1}^M r_{t,i}^2
+        BV_t = (pi / 2) * (M / (M - 1)) * sum_{i=2}^M |r_{t,i}| * |r_{t,i-1}|
+        J_t  = max(0.0, RV_t - BV_t)
+    Returns (rv, bv, jump).
+    """
+    r = np.asarray(returns, dtype=float)
+    r = r[np.isfinite(r)]
+    m = len(r)
+    if m < 2:
+        rv = float(np.sum(r**2)) if m == 1 else 0.0
+        return rv, rv, 0.0
+
+    rv = float(np.sum(r**2))
+    abs_r = np.abs(r)
+    mu_1_sq_inv = np.pi / 2.0
+    scale = float(m / (m - 1.0))
+    bv = float(scale * mu_1_sq_inv * np.sum(abs_r[1:] * abs_r[:-1]))
+    jump = float(max(0.0, rv - bv))
+    return rv, bv, jump
+
+
+def filter_xauusd_session_gaps(
+    df: pd.DataFrame,
+    timestamp_col: str = "timestamp",
+    maintenance_gap_minutes: float = 45.0,
+    weekend_gap_hours: float = 24.0,
+) -> pd.DataFrame:
+    """
+    Filter and tag 23/5 XAU/USD (Spot Gold) session boundaries:
+    - Daily 17:00–18:00 EST maintenance break (04:00–05:00 UTC+7 Phnom Penh)
+    - Friday 17:00 EST to Sunday 18:00 EST weekend closure
+    Guarantees continuous volatility and return metrics never bridge across market closures.
+    """
+    out = df.sort_values(timestamp_col).reset_index(drop=True).copy()
+    ts = pd.Series(pd.to_datetime(out[timestamp_col]))
+    gap_minutes = ts.diff().dt.total_seconds().div(60.0).fillna(0.0)
+    weekend_min = weekend_gap_hours * 60.0
+
+    out["bar_gap_minutes"] = gap_minutes.round(2)
+    out["is_daily_maintenance_jump"] = (gap_minutes >= maintenance_gap_minutes) & (
+        gap_minutes < weekend_min
+    )
+    out["is_weekend_open_jump"] = gap_minutes >= weekend_min
+    out["is_session_open_jump"] = (
+        out["is_daily_maintenance_jump"] | out["is_weekend_open_jump"]
+    )
+    if len(out) > 0:
+        out.loc[0, "is_session_open_jump"] = True
+    return out
+

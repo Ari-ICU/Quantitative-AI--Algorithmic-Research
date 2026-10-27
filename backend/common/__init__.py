@@ -15,6 +15,10 @@ from .validation import (
     classify_fx_trading_session,
     assert_strictly_causal_timestamps,
     PurgedEmbargoWalkForwardSplit,
+    compute_bipower_variation_and_jumps,
+    filter_xauusd_session_gaps,
+    compute_deflated_sharpe_ratio,
+    compute_cost_adjusted_profit_factor,
 )
 from .data_loader import (
     DATA_DIR,
@@ -46,6 +50,10 @@ __all__ = [
     "classify_fx_trading_session",
     "assert_strictly_causal_timestamps",
     "PurgedEmbargoWalkForwardSplit",
+    "compute_bipower_variation_and_jumps",
+    "filter_xauusd_session_gaps",
+    "compute_deflated_sharpe_ratio",
+    "compute_cost_adjusted_profit_factor",
     "DATA_DIR",
     "XAUUSD_1M_CSV",
     "XAUUSD_FOMC_EVENTS_CSV",

@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 import numpy as np
+import pandas as pd
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -48,6 +49,8 @@ from common.validation import (
     classify_fx_trading_session,
     compute_cost_adjusted_profit_factor,
     compute_deflated_sharpe_ratio,
+    compute_bipower_variation_and_jumps,
+    filter_xauusd_session_gaps,
     get_fx_default_spot_price,
     get_fx_pip_size,
 )
@@ -80,6 +83,29 @@ class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
         self.assertEqual(classify_fx_trading_session(datetime(2023, 6, 15, 9, 30)), "London_European")
         self.assertEqual(classify_fx_trading_session(datetime(2023, 6, 15, 15, 0)), "London_NY_Overlap")
         self.assertEqual(classify_fx_trading_session(datetime(2023, 6, 15, 21, 0)), "NewYork_Sydney")
+
+        # Test Bipower Variation (BV) and Jump (J) decomposition helper
+        synth_rets = np.array([0.001, -0.0012, 0.0009, 0.0055, -0.0008, 0.0011])  # 0.0055 is a jump
+        rv, bv, jump = compute_bipower_variation_and_jumps(synth_rets)
+        self.assertGreater(rv, 0.0)
+        self.assertGreater(bv, 0.0)
+        self.assertGreaterEqual(jump, 0.0)
+        self.assertAlmostEqual(rv, bv + jump, places=6)
+
+        # Test Session Gap filter helper
+        df_gap = pd.DataFrame({
+            "timestamp": [
+                datetime(2026, 5, 1, 16, 55),
+                datetime(2026, 5, 1, 18, 5),   # 70-min gap across 17:00-18:00 EST maintenance
+                datetime(2026, 5, 3, 18, 0),   # Weekend reopening jump
+            ],
+            "close": [2350.0, 2351.0, 2355.0],
+        })
+        tagged_gap = filter_xauusd_session_gaps(df_gap)
+        self.assertTrue(tagged_gap.loc[1, "is_daily_maintenance_jump"])
+        self.assertTrue(tagged_gap.loc[2, "is_weekend_open_jump"])
+        self.assertTrue(tagged_gap.loc[1, "is_session_open_jump"])
+        self.assertTrue(tagged_gap.loc[2, "is_session_open_jump"])
 
     def test_topic1_llm_vintage_lookahead_and_xauusd_polarity_guardrail(self) -> None:
         """Using a 2023-vintage LLM on a 2021 FOMC speech must raise LookAheadBiasError."""
