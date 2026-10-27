@@ -43,6 +43,10 @@ interface TickData {
   comex_futures_px: number;
   efp_basis_usd_oz: number;
   efp_basis_bps: number;
+  time_utc_iso?: string;
+  time_ict_iso?: string;
+  broker_tz_offset_hours?: number;
+  ipc_latency_ms?: number;
 }
 
 interface BarItem {
@@ -73,10 +77,12 @@ interface OrderCheckResult {
 
 interface LiveSignalData {
   timestamp_utc: string;
+  timestamp_ict?: string;
   symbol: string;
   action: string;
   direction: "BUY" | "SELL";
   signal_strength: string;
+  market_regime?: "Normal" | "High-Vol Jump" | "News Embargo Lock";
   composite_score: number;
   confidence_pct: number;
   entry_market_price: number;
@@ -92,6 +98,38 @@ interface LiveSignalData {
   risk_reward_ratio: string;
   timeframe: string;
   guardrails_all_clear: boolean;
+  meta_labeling?: {
+    formula: string;
+    target_vol_pct: number;
+    forecast_vol_ml_har_pct: number;
+    vol_scaling_factor: number;
+    w1_nlp_weight: number;
+    w2_micro_weight: number;
+    w4_efp_weight: number;
+    directional_tanh: number;
+    signed_position_scalar: number;
+    recommended_lots: number;
+    base_lot_reference: number;
+  };
+  microstructure_monitor?: {
+    bid: number;
+    ask: number;
+    micro_price: number;
+    spread_usd_oz: number;
+    spread_bps: number;
+    baseline_spread_bps: number;
+    max_resiliency_spread_bps: number;
+    spread_multiple_vs_normal: number;
+    resiliency_gate_2x_open: boolean;
+    efp_basis_usd_oz: number;
+    efp_basis_zscore: number;
+    kalman_hedge_ratio_beta: number;
+    hurst_exponent: number;
+    hurst_cointegrated_below_045: boolean;
+    jump_ratio_pct: number;
+    ipc_latency_ms: number;
+    market_regime: "Normal" | "High-Vol Jump" | "News Embargo Lock";
+  };
   pillars: {
     pillar1_macro: {
       name: string;
@@ -367,6 +405,99 @@ export default function XAUUSDQuantTerminalPage() {
         <text x="24" y="22" fill="#94a3b8" fontSize="11" fontWeight="600">
           Session High: ${maxP.toFixed(2)}/oz • Low: ${minP.toFixed(2)}/oz • Latest OTC Spot: $
           {closes[closes.length - 1].toFixed(2)}/oz ({bars.length} 1m bars, EFP Carry-Stripped)
+        </text>
+      </svg>
+    );
+  };
+
+  // Interactive JSON-driven SVG chart for Pillar 2 NFP Millisecond Spread & OFI
+  const renderPillar2JsonChart = () => {
+    if (!pillars || !pillars.pillar2.tick_series.length) return null;
+    const pts = pillars.pillar2.tick_series;
+    const width = 560;
+    const height = 175;
+    const spreads = pts.map((p) => p.spread_usd);
+    const maxS = Math.max(...spreads, 1.0);
+    const minS = Math.min(...spreads, 0.1);
+    const spanS = Math.max(maxS - minS, 0.2);
+
+    const polySpread = pts
+      .map((p, i) => {
+        const x = 14 + (i / (pts.length - 1)) * (width - 28);
+        const y = height - 20 - ((p.spread_usd - minS) / spanS) * (height - 44);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+
+    return (
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-44 w-full rounded-lg bg-slate-950 border border-slate-800">
+        <polyline fill="none" stroke="#f43f5e" strokeWidth="2.2" points={polySpread} />
+        <text x="18" y="18" fill="#cbd5e1" fontSize="10" fontWeight="600">
+          Live JSON Tick Series ({pts.length} pts): Peak NFP Spread ${maxS.toFixed(2)}/oz → τ_res Gate Recovery +
+          {pillars.pillar2.resiliency_recovery_ms.toFixed(0)}ms
+        </text>
+      </svg>
+    );
+  };
+
+  // Interactive JSON-driven SVG chart for Pillar 3 OOS Realized Vol vs HAR-RV-J vs Purged ML
+  const renderPillar3JsonChart = () => {
+    if (!pillars || !pillars.pillar3.vol_series.length) return null;
+    const pts = pillars.pillar3.vol_series;
+    const width = 560;
+    const height = 175;
+    const allVals = pts.flatMap((p) => [p.realized, p.purged_ml, p.har_rv_j, p.garch]);
+    const maxV = Math.max(...allVals, 20);
+    const minV = Math.min(...allVals, 5);
+    const spanV = Math.max(maxV - minV, 1);
+
+    const toPoly = (key: "realized" | "purged_ml" | "har_rv_j" | "garch") =>
+      pts
+        .map((p, i) => {
+          const x = 14 + (i / (pts.length - 1)) * (width - 28);
+          const y = height - 20 - ((p[key] - minV) / spanV) * (height - 44);
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        })
+        .join(" ");
+
+    return (
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-44 w-full rounded-lg bg-slate-950 border border-slate-800">
+        <polyline fill="none" stroke="#64748b" strokeWidth="1.3" points={toPoly("realized")} />
+        <polyline fill="none" stroke="#38bdf8" strokeWidth="2.0" points={toPoly("har_rv_j")} />
+        <polyline fill="none" stroke="#facc15" strokeWidth="2.0" points={toPoly("purged_ml")} />
+        <text x="18" y="18" fill="#cbd5e1" fontSize="10" fontWeight="600">
+          Live JSON OOS Volatility ({pts.length} folds): Realized (Slate) • HAR-RV-J (Sky) • Purged ML (Gold)
+        </text>
+      </svg>
+    );
+  };
+
+  // Interactive JSON-driven SVG chart for Pillar 4 Carry-Stripped EFP Basis & Z-Score
+  const renderPillar4JsonChart = () => {
+    if (!pillars || !pillars.pillar4.efp_series.length) return null;
+    const pts = pillars.pillar4.efp_series;
+    const width = 560;
+    const height = 175;
+    const zVals = pts.map((p) => p.z_score);
+    const maxZ = Math.max(...zVals, 2.5);
+    const minZ = Math.min(...zVals, -2.5);
+    const spanZ = Math.max(maxZ - minZ, 1);
+
+    const polyZ = pts
+      .map((p, i) => {
+        const x = 14 + (i / (pts.length - 1)) * (width - 28);
+        const y = height - 20 - ((p.z_score - minZ) / spanZ) * (height - 44);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+
+    return (
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-44 w-full rounded-lg bg-slate-950 border border-slate-800">
+        <polyline fill="none" stroke="#34d399" strokeWidth="2.0" points={polyZ} />
+        <text x="18" y="18" fill="#cbd5e1" fontSize="10" fontWeight="600">
+          Live JSON EFP Basis Z-Score ({pts.length} 5m bars): Mean Hurst H_t ={" "}
+          {pillars.pillar4.mean_hurst_exponent.toFixed(3)} &lt; 0.45 • Kalman β_t ={" "}
+          {pillars.pillar4.kalman_beta_mean.toFixed(4)}
         </text>
       </svg>
     );
@@ -700,6 +831,96 @@ export default function XAUUSDQuantTerminalPage() {
                       </div>
                     </div>
 
+                    {/* Live XAU/USD Microstructure Monitor & Hierarchical Meta-Labeling Position Sizer */}
+                    {signal.meta_labeling && signal.microstructure_monitor && (
+                      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                        <div className="rounded-xl border border-amber-500/30 bg-slate-950/90 p-3.5 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-xs font-bold uppercase tracking-wider text-amber-300">
+                              Hierarchical Meta-Labeling Position Sizer (Pillar 3 Filter)
+                            </span>
+                            <Badge variant="default">
+                              Recommended: {signal.meta_labeling.recommended_lots.toFixed(2)} Lots (
+                              {(signal.meta_labeling.recommended_lots * 100).toFixed(0)} oz)
+                            </Badge>
+                          </div>
+                          <p className="font-mono text-[11px] text-slate-300 bg-slate-900/90 px-2.5 py-1.5 rounded border border-slate-800">
+                            {signal.meta_labeling.formula}
+                          </p>
+                          <div className="grid grid-cols-3 gap-2 text-xs pt-1">
+                            <div className="rounded-lg bg-slate-900/70 p-2 border border-slate-800/80">
+                              <div className="text-[10px] text-slate-400">Vol Target / Forecast</div>
+                              <div className="font-mono font-bold text-sky-300">
+                                {signal.meta_labeling.target_vol_pct}% /{" "}
+                                {signal.meta_labeling.forecast_vol_ml_har_pct}%
+                              </div>
+                            </div>
+                            <div className="rounded-lg bg-slate-900/70 p-2 border border-slate-800/80">
+                              <div className="text-[10px] text-slate-400">Vol Lot Scalar (σ_t/σ̂)</div>
+                              <div className="font-mono font-bold text-amber-300">
+                                {signal.meta_labeling.vol_scaling_factor.toFixed(2)}x
+                              </div>
+                            </div>
+                            <div className="rounded-lg bg-slate-900/70 p-2 border border-slate-800/80">
+                              <div className="text-[10px] text-slate-400">Decay Weights (w1/w2/w4)</div>
+                              <div className="font-mono font-bold text-emerald-300">
+                                {signal.meta_labeling.w1_nlp_weight.toFixed(2)} /{" "}
+                                {signal.meta_labeling.w2_micro_weight.toFixed(2)} /{" "}
+                                {signal.meta_labeling.w4_efp_weight.toFixed(2)}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-sky-500/30 bg-slate-950/90 p-3.5 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-xs font-bold uppercase tracking-wider text-sky-300">
+                              Live XAU/USD Microstructure &amp; Regime Monitor
+                            </span>
+                            <Badge
+                              variant={
+                                signal.microstructure_monitor.market_regime === "Normal"
+                                  ? "emerald"
+                                  : signal.microstructure_monitor.market_regime === "High-Vol Jump"
+                                  ? "default"
+                                  : "rose"
+                              }
+                            >
+                              Regime: {signal.microstructure_monitor.market_regime}
+                            </Badge>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2 text-xs pt-1">
+                            <div className="rounded-lg bg-slate-900/70 p-2 border border-slate-800/80">
+                              <div className="text-[10px] text-slate-400">Spread vs 2.0x Gate</div>
+                              <div className="font-mono font-bold text-slate-100">
+                                {signal.microstructure_monitor.spread_bps.toFixed(2)} bps (
+                                {signal.microstructure_monitor.spread_multiple_vs_normal.toFixed(2)}x)
+                              </div>
+                            </div>
+                            <div className="rounded-lg bg-slate-900/70 p-2 border border-slate-800/80">
+                              <div className="text-[10px] text-slate-400">EFP Basis Z-Score</div>
+                              <div className="font-mono font-bold text-emerald-300">
+                                {signal.microstructure_monitor.efp_basis_zscore >= 0 ? "+" : ""}
+                                {signal.microstructure_monitor.efp_basis_zscore.toFixed(2)}σ (β=
+                                {signal.microstructure_monitor.kalman_hedge_ratio_beta.toFixed(4)})
+                              </div>
+                            </div>
+                            <div className="rounded-lg bg-slate-900/70 p-2 border border-slate-800/80">
+                              <div className="text-[10px] text-slate-400">Hurst H_t (&lt;0.45) &amp; Latency</div>
+                              <div className="font-mono font-bold text-amber-300">
+                                H={signal.microstructure_monitor.hurst_exponent.toFixed(3)} •{" "}
+                                {signal.microstructure_monitor.ipc_latency_ms.toFixed(2)}ms
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between text-[11px] text-slate-400 pt-0.5">
+                            <span>UTC Normalized: {signal.timestamp_utc}</span>
+                            <span>Cambodia (ICT UTC+7): {signal.timestamp_ict || "--"}</span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     {/* 4-Pillar Factor Breakdown Grid */}
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                       {[
@@ -1008,6 +1229,7 @@ export default function XAUUSDQuantTerminalPage() {
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4">
+                    {renderPillar2JsonChart()}
                     <img
                       src="/figures/02_news_microstructure_comparison.png"
                       alt="Pillar 2 Microstructure Chart"
@@ -1055,7 +1277,8 @@ export default function XAUUSDQuantTerminalPage() {
                       {pillars.pillar3.session_shares.COMEX_LBMA_Overlap}% of daily 24h XAU/USD variance
                     </CardDescription>
                   </CardHeader>
-                  <CardContent>
+                  <CardContent className="space-y-4">
+                    {renderPillar3JsonChart()}
                     <img
                       src="/figures/03_ml_vs_garch_volatility_comparison.png"
                       alt="Pillar 3 Volatility Chart"
@@ -1080,7 +1303,8 @@ export default function XAUUSDQuantTerminalPage() {
                       {pillars.pillar4.regime_bars_halted} EFP Squeeze Bars Halted
                     </CardDescription>
                   </CardHeader>
-                  <CardContent>
+                  <CardContent className="space-y-4">
+                    {renderPillar4JsonChart()}
                     <img
                       src="/figures/04_fx_cross_rate_arbitrage_comparison.png"
                       alt="Pillar 4 EFP Arbitrage Chart"

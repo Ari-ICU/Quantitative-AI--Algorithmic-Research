@@ -350,17 +350,34 @@ class TestQuantitativeXAUUSDResearchGuardrails(unittest.TestCase):
         self.assertGreater(arb_res["cost_adjusted_profit_factor"], 0.0)
 
     def test_live_4pillar_xauusd_signal_engine(self) -> None:
-        """Verify the real-time 4-Pillar XAU/USD signal engine (`backend/signal_engine.py`)."""
+        """Verify Hierarchical Meta-Labeling & EET->UTC normalization in `backend/signal_engine.py`."""
         bridge = macos_mt5.MacOSMetaTraderBridge(mode="live_yahoo_ecn")
-        bridge.initialize()
+        self.assertTrue(bridge.initialize())
+
+        # Verify MT5 Broker EET (UTC+2) / EEST (UTC+3) timestamp normalization to UTC
+        eet_naive = datetime(2026, 5, 1, 15, 30, 0)  # 15:30 EEST (UTC+3) = 12:30 UTC (08:30 EDT NFP)
+        utc_dt = macos_mt5.normalize_mt5_broker_timestamp_to_utc(eet_naive, broker_tz_offset_hours=3)
+        self.assertEqual(utc_dt.hour, 12)
+        self.assertEqual(utc_dt.minute, 30)
+
         tick = bridge.symbol_info_tick("XAU/USD")
         bars = bridge.copy_rates_from_pos("XAU/USD", macos_mt5.TIMEFRAME_M1, 0, 90, prefer_live=False)
         sig = signal_engine.compute_live_xauusd_4pillar_signal(tick=tick, bars_df=bars)
 
         self.assertEqual(sig["symbol"], "XAU/USD")
         self.assertIn(sig["direction"], ("BUY", "SELL"))
+        self.assertIn(sig["market_regime"], ("Normal", "High-Vol Jump", "News Embargo Lock"))
+        self.assertIn("meta_labeling", sig)
+        self.assertIn("microstructure_monitor", sig)
         self.assertGreater(float(sig["entry_market_price"]), 0.0)
         self.assertGreater(float(sig["risk_usd_oz"]), 0.0)
+
+        # Verify 3.0-second post-NFP embargo lock sets recommended_lots = 0.0 and News Embargo Lock
+        sig_locked = signal_engine.compute_live_xauusd_4pillar_signal(
+            tick=tick, bars_df=bars, active_nfp_seconds_elapsed=1.5
+        )
+        self.assertEqual(sig_locked["market_regime"], "News Embargo Lock")
+        self.assertEqual(sig_locked["meta_labeling"]["recommended_lots"], 0.0)
         self.assertIn("pillar1_macro", sig["pillars"])
         self.assertIn("pillar2_microstructure", sig["pillars"])
         self.assertIn("pillar3_volatility", sig["pillars"])
