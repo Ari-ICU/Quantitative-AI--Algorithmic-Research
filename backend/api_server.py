@@ -3,11 +3,11 @@ REST API Server (`backend/api_server.py`) for the `XAU/USD` Quantitative AI & ma
 
 Endpoints:
 - `GET /api/tick`: Live London/Swissquote OTC Spot `XAU/USD` BBO tick (Exness parity), 1m bars, and 4-Pillar Signal.
-- `GET /api/signal`: Dedicated 4-Pillar `XAU/USD` Live Trading Signal (`BUY`/`SELL`, Entry, SL, TP1, TP2, TP3).
-- `GET /api/order_check?side=buy&lots=5.0&max_spread_bps=3.5`: Guarded `mt5.order_check()` simulation.
-- `GET /api/pillars`: Empirical metrics & time-series across Pillars `01`–`04` and 8 IEEE/Scopus Q1 papers.
+- `GET /api/signal`: Dedicated 4-Pillar `XAU/USD` Live Trading Signal (`BUY`/`SELL`, Entry, SL, TP1, TP2, TP3, Meta-Labeling).
+- `GET /api/order_check?side=buy&lots=5.0&max_spread_bps=2.5`: Guarded `mt5.order_check()` simulation.
+- `GET /api/pillars`: Non-blocking JSON empirical metrics & time-series across Pillars `01`–`04` (cached via `ProcessPoolExecutor`).
 - `GET /api/benchmarks`: Summary benchmark metrics dictionary.
-- `GET /figures/*` & `GET /papers/*`: Static figures and `.docx` / `.pdf` / `.tex` academic manuscripts.
+- `GET /figures/*`: Static comparison figures.
 """
 
 from __future__ import annotations
@@ -15,10 +15,15 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
-from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from backend.research_service import PROJECT_ROOT, get_cached_benchmarks, get_cached_pillars_payload
+from backend.research_service import (
+    CACHE_JSON_PATH,
+    PROJECT_ROOT,
+    get_cached_benchmarks,
+    get_cached_pillars_payload,
+    trigger_async_pillars_recompute,
+)
 from backend.signal_engine import compute_live_xauusd_4pillar_signal
 from common.macos_mt5_bridge import TIMEFRAME_M1, MacOSMetaTraderBridge
 
@@ -27,7 +32,7 @@ BRIDGE.initialize()
 
 
 class XAUUSDBackendAPIHandler(BaseHTTPRequestHandler):
-    """HTTP handler serving the `XAU/USD` JSON API endpoints, figures, and paper files."""
+    """HTTP handler serving the `XAU/USD` JSON API endpoints and figures."""
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         return
@@ -54,6 +59,7 @@ class XAUUSDBackendAPIHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        qs = parse_qs(parsed.query)
 
         if path in ("/", "/api/health"):
             self._send_json(
@@ -61,6 +67,7 @@ class XAUUSDBackendAPIHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "service": "XAU/USD Quantitative AI & macOS MT5 Backend API",
                     "frontend_url": "http://localhost:3000",
+                    "cache_ready": CACHE_JSON_PATH.is_file(),
                     "endpoints": [
                         "/api/tick",
                         "/api/signal",
@@ -105,10 +112,9 @@ class XAUUSDBackendAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/order_check":
-            qs = parse_qs(parsed.query)
             side = "sell" if qs.get("side", ["buy"])[0].lower() == "sell" else "buy"
             lots = float(qs.get("lots", ["5.0"])[0])
-            max_spread = float(qs.get("max_spread_bps", ["3.5"])[0])
+            max_spread = float(qs.get("max_spread_bps", ["2.5"])[0])
             chk = BRIDGE.order_check(
                 side=side,  # type: ignore[arg-type]
                 volume_lots=lots,
@@ -122,6 +128,12 @@ class XAUUSDBackendAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/pillars":
+            if qs.get("refresh", ["false"])[0].lower() == "true":
+                worker_state = trigger_async_pillars_recompute()
+                payload = dict(get_cached_pillars_payload())
+                payload["worker_status"] = worker_state
+                self._send_json(payload)
+                return
             self._send_json(get_cached_pillars_payload())
             return
 
@@ -143,7 +155,9 @@ class XAUUSDBackendAPIHandler(BaseHTTPRequestHandler):
 
 
 def run_backend_server(host: str = "127.0.0.1", port: int = 8050) -> None:
-    """Start the multi-threaded `XAU/USD` Python backend API server."""
+    """Start the multi-threaded `XAU/USD` Python backend API server & pre-warm ProcessPoolExecutor cache."""
+    if not CACHE_JSON_PATH.is_file():
+        trigger_async_pillars_recompute()
     server = ThreadingHTTPServer((host, port), XAUUSDBackendAPIHandler)
     print(f"=== XAU/USD Python Backend API Server Running at http://{host}:{port} ===")
     try:
